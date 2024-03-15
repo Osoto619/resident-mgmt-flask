@@ -58,12 +58,12 @@ def get_resident_id(resident_name):
 def get_db_connection():
     connection = None
     try:
-        # Ubuntu MySQL connection
+        # Heroku JawsDB MySQL connection
         connection = mysql.connector.connect(
-            user='oscar',
-            password='Discorama619!',
-            host='75.134.160.201',
-            database='resident_data'
+            user='pozl9cpm2uqcwpua',
+            password='rp0a76nf9cerxtb2',
+            host='k9xdebw4k3zynl4u.cbetxkdyhwsb.us-east-1.rds.amazonaws.com',
+            database='ci3kn5xmdkiffd0u'
         )
         # Google Cloud MySQL connection
         # connection = mysql.connector.connect(
