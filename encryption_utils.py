@@ -21,7 +21,8 @@ def generate_strong_passphrase(length=15):
 
 
 # Check if the environment variable exists
-passphrase_env_var = os.environ.get('RESIDENT_MGMT_DB_KEY')
+#passphrase_env_var = os.environ.get('RESIDENT_MGMT_DB_KEY')
+passphrase_env_var = 'caretechdevmode'
 if passphrase_env_var:
     passphrase = passphrase_env_var.encode()  # Proceed with encoding if exists
 else:
