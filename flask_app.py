@@ -1,4 +1,5 @@
 from flask import Flask, jsonify, request
+import os
 import logging
 from flask_jwt_extended import create_access_token, JWTManager , jwt_required, get_jwt_identity
 import mysql.connector
@@ -6,6 +7,7 @@ from mysql.connector import Error
 import bcrypt
 from encryption_utils import encrypt_data, decrypt_data
 from datetime import datetime, timedelta
+from urllib.parse import urlparse
 
 logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s')
 
@@ -58,20 +60,17 @@ def get_resident_id(resident_name):
 def get_db_connection():
     connection = None
     try:
+        # Heroku JawsDB MySQL connection using environment variable
+        jawsdb_url = urlparse(os.environ['JAWSDB_URL'])
         # Heroku JawsDB MySQL connection
         connection = mysql.connector.connect(
-            user='pozl9cpm2uqcwpua',
-            password='rp0a76nf9cerxtb2',
-            host='k9xdebw4k3zynl4u.cbetxkdyhwsb.us-east-1.rds.amazonaws.com',
-            database='ci3kn5xmdkiffd0u'
+            user=jawsdb_url.username,
+            password=jawsdb_url.password,
+            host=jawsdb_url.hostname,
+            database=jawsdb_url.path[1:],
+            port=jawsdb_url.port
         )
-        # Google Cloud MySQL connection
-        # connection = mysql.connector.connect(
-        #     user='oscar',
-        #     password='rir718hhzrthzr',
-        #     host='34.94.226.95',
-        #     database='resident_data'
-        # )
+        
     except Error as err:
         print(f"Error: '{err}'")
     return connection
