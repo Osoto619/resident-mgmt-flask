@@ -58,11 +58,11 @@ def get_resident_id(resident_name):
 def get_db_connection():
     connection = None
     try:
-        # Local MySQL connection
+        # Ubuntu MySQL connection
         connection = mysql.connector.connect(
             user='oscar',
             password='Discorama619!',
-            host='127.0.0.1',
+            host='75.134.160.201',
             database='resident_data'
         )
         # Google Cloud MySQL connection
@@ -1117,4 +1117,4 @@ def test_fetch_adl_chart_data():
 
 
 if __name__ == '__main__':
-    app.run(debug=True)
+    app.run(debug=True, host='0.0.0.0', port=5180)
