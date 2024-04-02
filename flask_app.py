@@ -1,5 +1,6 @@
 from flask import Flask, jsonify, request
 import os
+import calendar
 import logging
 from flask_jwt_extended import create_access_token, JWTManager , jwt_required, get_jwt_identity
 import mysql.connector
@@ -8,6 +9,7 @@ import bcrypt
 from encryption_utils import encrypt_data, decrypt_data
 from datetime import datetime, timedelta
 from urllib.parse import urlparse
+#from base_meal_data import breakfast, lunch, dinner , breakfast_drink
 
 logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s')
 
@@ -70,7 +72,7 @@ def get_db_connection():
             database=jawsdb_url.path[1:],
             port=jawsdb_url.port
         )
-        
+    
     except Error as err:
         print(f"Error: '{err}'")
     return connection
@@ -520,6 +522,61 @@ def insert_resident():
         return jsonify({'error': str(e)}), 500
 
 
+@app.route('/remove_resident', methods=['POST'])
+@jwt_required()
+def remove_resident():
+    data = request.json
+    resident_name = data['resident_name']
+    username = get_jwt_identity()
+
+    if not is_user_admin(username):
+        return jsonify({'error': 'Unauthorized: Only admins can remove residents.'}), 403
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        
+        resident_id = get_resident_id(resident_name)
+        
+        # Begin transaction
+        conn.start_transaction()
+
+        # Delete related ADL data
+        cursor.execute("DELETE FROM adl_chart WHERE resident_id = %s", (resident_id,))
+        
+        # Delete related EMAR data
+        cursor.execute("DELETE FROM emar_chart WHERE resident_id = %s", (resident_id,))
+
+        # Delete related non medication orders
+        cursor.execute("DELETE FROM non_medication_orders WHERE resident_id = %s", (resident_id,))
+
+        # Before deleting medications, delete entries from medication_time_slots
+        cursor.execute("""
+            DELETE mts FROM medication_time_slots mts
+            JOIN medications m ON mts.medication_id = m.id
+            WHERE m.resident_id = %s
+        """, (resident_id,))
+
+        # Delete related medications
+        cursor.execute("DELETE FROM medications WHERE resident_id = %s", (resident_id,))
+
+        # Add more DELETE statements for other related tables as needed
+
+        # Finally, delete the resident
+        cursor.execute("DELETE FROM residents WHERE id = %s", (resident_id,))
+        
+        # Commit transaction
+        conn.commit()
+        log_action(username, 'Resident Removed', f'Resident Removed {resident_name}')
+        return jsonify({'message': f'Resident {resident_name} has been removed successfully'}), 200
+    except Error as e:
+        conn.rollback()
+        return jsonify({'error': str(e)}), 500
+    finally:
+        if conn.is_connected():
+            cursor.close()
+            conn.close()
+
+
 # --------------------------------- adl_chart Table --------------------------------- #
 
 @app.route('/fetch_adl_data_for_resident/<resident_name>', methods=['GET'])
@@ -660,10 +717,39 @@ def save_adl_data_from_management_window():
             )
             cursor.execute(sql, data_tuple)
             conn.commit()
-            log_action(get_jwt_identity(), 'ADL Data Saved', audit_description)
+            log_action(get_jwt_identity(), 'ADL Data Update', audit_description)
             return jsonify({'message': 'ADL data saved successfully'}), 200
     except Exception as e:
         return jsonify({'error': str(e)}), 500
+
+
+@app.route('/does_adl_chart_exist/<resident_name>/<year_month>', methods=['GET'])
+def does_adl_chart_data_exist(resident_name, year_month):
+    resident_id = get_resident_id(resident_name)
+    if resident_id is None:
+        return jsonify({'error': f"Resident named {resident_name} not found"}), 404
+
+    year, month = year_month.split('-')
+
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        query = '''
+            SELECT EXISTS(
+                SELECT 1 FROM adl_chart ac
+                WHERE ac.resident_id = %s 
+                AND YEAR(ac.chart_date) = %s 
+                AND MONTH(ac.chart_date) = %s
+            )
+        '''
+        cursor.execute(query, (resident_id, year, month))
+        exists = cursor.fetchone()[0]
+        return jsonify({'exists': bool(exists)}), 200
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+    finally:
+        if conn and conn.is_connected():
+            conn.close()
 
 
 # --------------------------------- medications Table --------------------------------- #
@@ -883,6 +969,36 @@ def fetch_all_non_medication_orders_for_resident(resident_name):
             conn.close()
 
 
+@app.route('/get_controlled_medication_details/<resident_name>/<medication_name>', methods=['GET'])
+@jwt_required()
+def get_controlled_medication_details(resident_name, medication_name):
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+
+        resident_id = get_resident_id(resident_name)
+
+        # Fetch the count and form for the specified controlled medication
+        cursor.execute('''
+            SELECT count, medication_form FROM medications 
+            WHERE resident_id = %s AND medication_name = %s AND medication_type = 'Controlled'
+        ''', (resident_id, medication_name))
+        result = cursor.fetchone()
+
+        if result is None:
+            return jsonify({'error': 'Medication not found or not a controlled type'}), 404
+
+        medication_count, medication_form = result
+        return jsonify({'count': medication_count, 'form': medication_form}), 200
+
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+    finally:
+        if conn.is_connected():
+            cursor.close()
+            conn.close()
+
+
 # -------------------------------- non_medication_orders Table -------------------------------- #
 
 @app.route('/add_non_medication_order/<resident_name>', methods=['POST'])
@@ -1000,41 +1116,72 @@ def fetch_emar_data_for_resident(resident_name):
             conn.close()
 
 
-@app.route('/fetch_emar_data_for_month/<resident_name>', methods=['GET'])
+@app.route('/fetch_emar_data_for_resident_audit_log/<resident_name>', methods=['GET'])
 @jwt_required()
-def fetch_emar_data_for_month(resident_name):
-    year_month = request.args.get('year_month', None)
-    if not year_month:
-        return jsonify({'error': 'Year and month parameter is required'}), 400
-
+def fetch_emar_data_for_resident_audit_log(resident_name):
+    today = datetime.now().strftime("%Y-%m-%d")
     resident_id = get_resident_id(resident_name)
+    
     if not resident_id:
         return jsonify({'error': 'Resident not found'}), 404
-
+    
     try:
         conn = get_db_connection()
         with conn.cursor() as cursor:
-            # Fetch eMAR data for the resident for the specified month
             cursor.execute("""
-                SELECT m.medication_name, DATE_FORMAT(e.chart_date, '%Y-%m-%d') as chart_date, e.time_slot, e.administered
+                SELECT m.medication_name, e.time_slot, e.administered, e.chart_date
                 FROM emar_chart e
                 JOIN medications m ON e.medication_id = m.id
-                WHERE e.resident_id = %s AND DATE_FORMAT(e.chart_date, '%%Y-%%m') = %s
-                ORDER BY e.chart_date, e.time_slot
-            """, (resident_id, year_month))
+                WHERE e.resident_id = %s AND e.chart_date = %s
+            """, (resident_id, today))
             
             results = cursor.fetchall()
 
-        # Organize eMAR data
-        emar_data = [{'medication_name': row[0], 'date': row[1], 'time_slot': row[2], 'administered': row[3]} for row in results]
+        # Format the data similarly to the old SQLite function's output
+        emar_data = [{'resident_name': resident_name, 
+                      'medication_name': result[0], 
+                      'time_slot': result[1], 
+                      'administered': result[2], 
+                      'date': result[3]} for result in results]
 
         return jsonify(emar_data), 200
     except Exception as e:
         return jsonify({'error': str(e)}), 500
     finally:
-        if conn.is_connected():
+        if conn and conn.is_connected():
             conn.close()
 
+
+@app.route('/fetch_emar_data_for_month/<resident_name>/<year_month>', methods=['GET'])
+@jwt_required()
+def fetch_emar_data_for_month_simplified(resident_name, year_month):
+    resident_id = get_resident_id(resident_name)
+    if not resident_id:
+        return jsonify({'error': 'Resident not found'}), 404
+
+    year, month = year_month.split('-')
+
+    try:
+        conn = get_db_connection()
+        with conn.cursor() as cursor:
+            query = """
+                SELECT m.medication_name, e.chart_date, e.time_slot, e.administered
+                FROM emar_chart e
+                JOIN medications m ON e.medication_id = m.id
+                WHERE e.resident_id = %s AND YEAR(e.chart_date) = %s AND MONTH(e.chart_date) = %s
+                ORDER BY e.chart_date, e.time_slot
+            """
+            cursor.execute(query, (resident_id, year, month))
+            results = cursor.fetchall()
+
+            emar_data = [{'medication_name': row[0], 'chart_date': row[1].strftime('%Y-%m-%d'), 'time_slot': row[2], 'administered': row[3]} for row in results]
+
+            return jsonify(emar_data), 200
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+    finally:
+        if conn.is_connected():
+            conn.close()
 
 
 @app.route('/save_emar_data', methods=['POST'])
@@ -1075,11 +1222,6 @@ def save_emar_data_from_management_window():
             """
             cursor.execute(sql, (resident_id, medication_id, entry['date'], entry['time_slot'], entry['administered']))
             conn.commit()
-            
-            # Log the action with audit description
-            if audit_description:
-                log_action(username, "EMAR Data Update", audit_description)
-
             responses.append({'status': 'success', 'message': 'Data saved successfully'})
         except mysql.connector.Error as err:
             conn.rollback()
@@ -1087,33 +1229,434 @@ def save_emar_data_from_management_window():
         finally:
             cursor.close()
             conn.close()
+    # Log the action with audit description
+    if audit_description:
+        log_action(username, "EMAR Data Update", audit_description)
 
     return jsonify(responses)
 
-# --------------------------------- Test Endpoints --------------------------------- #
 
-@app.route('/test_fetch_adl_chart_data', methods=['GET'])
-def test_fetch_adl_chart_data():
+@app.route('/does_emars_chart_exist/<resident_name>/<year_month>', methods=['GET'])
+def does_emars_chart_data_exist(resident_name, year_month):
+    resident_id = get_resident_id(resident_name)
+    if resident_id is None:
+        return jsonify({'error': f"Resident named {resident_name} not found"}), 404
+
+    year, month = year_month.split('-')
+
     try:
-        conn = get_db_connection()  # Ensure this uses your existing DB connection function
-        with conn.cursor(dictionary=True) as cursor:  # Using dictionary=True for convenience
-            # Hard-coded query for testing
-            query = '''
-                SELECT * FROM adl_chart
-                WHERE resident_id = 1 AND DATE_FORMAT(chart_date, '%Y-%m') = '2024-02'
-                ORDER BY chart_date
-            '''
-            cursor.execute(query)
-            results = cursor.fetchall()
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        query = '''
+            SELECT EXISTS(
+                SELECT 1 FROM emar_chart
+                WHERE resident_id = %s 
+                AND YEAR(chart_date) = %s 
+                AND MONTH(chart_date) = %s
+            )
+        '''
+        print(f"Executing eMARs existence check with resident_id: {resident_id}, year: {year}, month: {month}")
+        cursor.execute(query, (resident_id, year, month))
+        exists = cursor.fetchone()[0]
+        return jsonify({'exists': bool(exists)}), 200
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+    finally:
+        if conn and conn.is_connected():
+            conn.close()
 
-            if results:
-                return jsonify(results), 200
-            else:
-                return jsonify([]), 200
+
+@app.route('/save_prn_administration', methods=['POST'])
+@jwt_required()
+def save_prn_administration_data():
+    data = request.json
+    resident_name = data['resident_name']
+    medication_name = data['medication_name']
+    admin_data = data['admin_data']
+    username = get_jwt_identity()
+
+    # Extracting date and time from the 'datetime' string
+    admin_date, admin_time = admin_data['datetime'].split(' ')
+
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+
+        # Retrieve resident ID and medication ID
+        cursor.execute("SELECT id FROM residents WHERE name = %s", (resident_name,))
+        resident_id_result = cursor.fetchone()
+        if not resident_id_result:
+            return jsonify({'error': 'Resident not found'}), 404
+
+        resident_id = resident_id_result[0]
+
+        cursor.execute("SELECT id FROM medications WHERE medication_name = %s AND resident_id = %s", (medication_name, resident_id))
+        medication_id_result = cursor.fetchone()
+        if not medication_id_result:
+            return jsonify({'error': 'Medication not found'}), 404
+
+        medication_id = medication_id_result[0]
+
+        # Insert administration data into emar_chart, including chart_time
+        cursor.execute('''
+            INSERT INTO emar_chart (resident_id, medication_id, chart_date, chart_time, administered, notes)
+            VALUES (%s, %s, %s, %s, %s, %s)
+        ''', (resident_id, medication_id, admin_date, admin_time, admin_data['administered'], admin_data['notes']))
+
+        conn.commit()
+
+        # Formatting the date and time for the log message
+        # Assuming 'admin_date' and 'admin_time' are in 'YYYY-MM-DD' and 'HH:MM' formats respectively
+        datetime_str = f"{admin_date} {admin_time}" if admin_time else admin_date
+        log_message = f"PRN Administered {medication_name} to {resident_name} at {datetime_str}"
+        
+        log_action(username, 'PRN Administration', log_message)
+        
+        return jsonify({'message': 'Administration data saved successfully'}), 201
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+    finally:
+        if conn.is_connected():
+            conn.close()
+
+
+@app.route('/fetch_prn_data_for_day/<resident_name>/<medication_name>/<year_month>/<day>', methods=['GET'])
+@jwt_required()
+def fetch_prn_data_for_day(resident_name, medication_name, year_month, day):
+    day = day.zfill(2)  # Ensure day is two digits
+    date_query = f'{year_month}-{day}'
+
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        # Use TIME_FORMAT to convert chart_time to a string within the SQL query
+        query = '''
+            SELECT e.chart_date, TIME_FORMAT(e.chart_time, '%H:%i') AS formatted_time, e.administered, e.notes
+            FROM emar_chart e
+            JOIN residents r ON e.resident_id = r.id
+            JOIN medications m ON e.medication_id = m.id
+            WHERE r.name = %s AND m.medication_name = %s AND e.chart_date LIKE %s
+        '''
+        cursor.execute(query, (resident_name, medication_name, date_query + '%'))
+        result = cursor.fetchall()
+
+        # Now, formatted_time is directly usable as a string
+        prn_data = [{'date': row[0].strftime('%Y-%m-%d') + ' ' + (row[1] if row[1] else ''), 'administered': row[2], 'notes': row[3]} for row in result]
+        return jsonify(prn_data), 200
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+    finally:
+        if conn.is_connected():
+            conn.close()
+
+
+@app.route('/fetch_monthly_medication_data/<resident_name>/<medication_name>/<year_month>/<medication_type>', methods=['GET'])
+@jwt_required()
+def fetch_monthly_medication_data(resident_name, medication_name, year_month, medication_type):
+    resident_id = get_resident_id(resident_name)
+    if not resident_id:
+        return jsonify({'error': 'Resident not found'}), 404
+
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+
+        # Fetch medication ID
+        cursor.execute("SELECT id FROM medications WHERE medication_name = %s AND resident_id = %s", (medication_name, resident_id))
+        medication_id_result = cursor.fetchone()
+        if not medication_id_result:
+            return jsonify({'error': 'Medication not found'}), 404
+        medication_id = medication_id_result[0]
+
+        # Query for the entire month
+        year, month = year_month.split('-')
+        start_date = f"{year}-{month}-01"
+        end_date = f"{year}-{month}-{calendar.monthrange(int(year), int(month))[1]}"
+
+        query = """
+            SELECT e.chart_date, TIME_FORMAT(e.chart_time, '%H:%i') AS formatted_time, e.administered, e.notes
+            FROM emar_chart e
+            WHERE e.resident_id = %s AND e.medication_id = %s AND e.chart_date BETWEEN %s AND %s
+            ORDER BY e.chart_date, e.chart_time
+        """
+        cursor.execute(query, (resident_id, medication_id, start_date, end_date))
+
+        results = cursor.fetchall()
+        medication_data = [{'date': row[0].strftime('%Y-%m-%d') + ' ' + row[1], 'administered': row[2], 'notes': row[3]} for row in results]
+
+        return jsonify(medication_data), 200
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+    finally:
+        if conn.is_connected():
+            conn.close()
+
+
+@app.route('/save_controlled_administration', methods=['POST'])
+@jwt_required()
+def save_controlled_administration():
+    data = request.get_json()
+    resident_name = data['resident_name']
+    medication_name = data['medication_name']
+    admin_data = data['admin_data']
+    new_count = data['new_count']
+
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+
+        # Ensure autocommit is disabled to manage transactions manually
+        conn.autocommit = False
+
+        # Retrieve resident ID and medication ID
+        resident_id = get_resident_id(resident_name)
+
+        cursor.execute("SELECT id FROM medications WHERE medication_name = %s AND resident_id = %s", (medication_name, resident_id))
+        medication_id_result = cursor.fetchone()
+        if medication_id_result is None:
+            return jsonify({'error': 'Medication not found'}), 404
+        medication_id = medication_id_result[0]
+
+        # Insert administration data into emar_chart, including the new count
+        cursor.execute('''
+            INSERT INTO emar_chart (resident_id, medication_id, chart_date, administered, notes, current_count)
+            VALUES (%s, %s, %s, %s, %s, %s)
+        ''', (resident_id, medication_id, admin_data['datetime'], admin_data['administered'], admin_data['notes'], new_count))
+
+        # Update medication count in medications table
+        cursor.execute('''
+            UPDATE medications
+            SET count = %s
+            WHERE id = %s
+        ''', (new_count, medication_id))
+
+        # Commit transaction
+        conn.commit()
+        return jsonify({'message': 'Controlled medication administration data saved successfully'}), 200
+
+    except Exception as e:
+        if conn.is_connected():
+            conn.rollback()
+        return jsonify({'error': str(e)}), 500
+    finally:
+        if conn.is_connected():
+            cursor.close()
+            conn.close()
+
+
+# -------------------------------- activities Table -------------------------------- #
+
+@app.route('/fetch_activities', methods=['GET'])
+def fetch_activities():
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute('SELECT activity_name FROM activities')
+        activities = [row[0] for row in cursor.fetchall()]
+        return jsonify({'activities': activities}), 200
     except Error as e:
         return jsonify({'error': str(e)}), 500
+    finally:
+        if conn and conn.is_connected():
+            conn.close()
 
+
+@app.route('/add_activity', methods=['POST'])
+def add_activity():
+    try:
+        activity_name = request.json['activity_name']
+        if not activity_name:
+            return jsonify({'error': 'Activity name is required'}), 400
+
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute('INSERT INTO activities (activity_name) VALUES (%s)', (activity_name,))
+        conn.commit()
+
+        return jsonify({'message': 'Activity added successfully'}), 201
+    except Error as e:
+        return jsonify({'error': str(e)}), 500
+    finally:
+        if conn and conn.is_connected():
+            conn.close()
+
+
+@app.route('/remove_activity', methods=['POST'])
+def remove_activity():
+    data = request.get_json()
+    activity_name = data.get('activity_name')
+    if not activity_name:
+        return jsonify({'error': 'Activity name is required'}), 400
+    
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute('DELETE FROM activities WHERE activity_name = %s', (activity_name,))
+        conn.commit()
+        return jsonify({'message': f'Activity "{activity_name}" removed successfully'}), 200
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+    finally:
+        if conn and conn.is_connected():
+            conn.close()
+
+# --------------------------------- meals Table ------------------------------------ #
+
+@app.route('/fetch_meal_data/<meal_type>', methods=['GET'])
+def fetch_meal_data(meal_type):
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        # Safely query the database with the provided meal_type
+        query = 'SELECT meal_option, default_drink FROM meals WHERE meal_type = %s'
+        cursor.execute(query, (meal_type,))
+        meals = cursor.fetchall()
+        
+        processed_meals = []
+        for meal_option, default_drink in meals:
+            # Split the meal_option by '; ' to recreate the list
+            options = [option.strip(' ;') for option in meal_option.split('; ')]
+            # Append default_drink for breakfast meals, ensuring no trailing semicolon
+            if meal_type == 'breakfast' and default_drink:
+                options.append(default_drink.strip(' ;'))
+            processed_meals.append(options)
+        
+        # Return the processed meals as a JSON response
+        return jsonify({'meals': processed_meals})
+    except Exception as e:
+        # Handle exceptions and return an error message
+        return jsonify({'error': str(e)}), 500
+    finally:
+        if conn and conn.is_connected():
+            conn.close()
+
+
+@app.route('/fetch_raw_meal_data/<meal_type>', methods=['GET'])
+def fetch_raw_meal_data(meal_type):
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        # Fetch meal_option and, for breakfast, also default_drink
+        query = 'SELECT meal_option, default_drink FROM meals WHERE meal_type = %s'
+        cursor.execute(query, (meal_type,))
+        meals = cursor.fetchall()
+        
+        # Process meals to include default_drink for breakfast
+        raw_meals = []
+        for meal_option, default_drink in meals:
+            if meal_type == 'breakfast' and default_drink:
+                # Concatenate default_drink with meal_option for breakfast
+                raw_meal = f'{meal_option} {default_drink}'
+            else:
+                # Use meal_option as is for lunch and dinner
+                raw_meal = meal_option
+            raw_meals.append(raw_meal)
+        
+        # Return the raw meals as a JSON response
+        return jsonify({'meals': raw_meals})
+    except Exception as e:
+        # Handle exceptions and return an error message
+        return jsonify({'error': str(e)}), 500
+    finally:
+        if conn and conn.is_connected():
+            conn.close()
+
+
+
+@app.route('/add_meal', methods=['POST'])
+def add_meal():
+    data = request.json
+    meal_type = data.get('meal_type')
+    meal_option = data.get('meal_option')
+    default_drink = data.get('default_drink', None)  # Optional, defaults to None
+
+    try:
+        conn = get_db_connection()
+        if conn:
+            cursor = conn.cursor()
+            query = "INSERT INTO meals (meal_type, meal_option, default_drink) VALUES (%s, %s, %s)"
+            cursor.execute(query, (meal_type, meal_option, default_drink))
+            conn.commit()
+            return jsonify({'message': 'Meal added successfully'}), 201
+        else:
+            return jsonify({'error': 'Failed to connect to the database'}), 500
+    except Error as e:
+        return jsonify({'error': str(e)}), 500
+    finally:
+        if conn and conn.is_connected():
+            conn.close()
+
+
+@app.route('/remove_meal/<meal_type>', methods=['POST'])
+def remove_meal(meal_type):
+    try:
+        # Assuming the meal_option is sent in the request's JSON body
+        data = request.get_json()
+        meal_option = data['meal_option']
+
+        conn = get_db_connection()
+        cursor = conn.cursor()
+
+        # Deleting the meal from the database
+        cursor.execute('DELETE FROM meals WHERE meal_type = %s AND meal_option = %s', (meal_type, meal_option))
+
+        conn.commit()
+        return jsonify({'message': 'Meal removed successfully'}), 200
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+    finally:
+        if conn and conn.is_connected():
+            conn.close()
+
+
+# ---------------------------------------- Data Insertion ----------------------------------------- #
+
+# def activities_list ():
+#     activity_list = ["Movies", "Walk", "Exercise", "Bird Watching", "Puzzles", "Trivia", "Baking",
+#               "Gardening", "Stretching", "Family Calls", "ROM Exercise", "Coloring", "Arts & Crafts", "Bingo",
+#               "Card Games", "Music", "Board Games", "Dominoes", "Balloon Volleyball", "Tea Time Social", "Arts and Music", "Chair Zumba", "Virtual Museum Tours", "Indoor Bowling",
+#               "Puzzle Quilts", "Ice-Cream Social", "Indoor Minigolf", "Brain Teasers", "Group Meditation", "DIY Craft Projects", "Group Painting", "Storytelling Circle"]
+
+#     try:
+#         conn = get_db_connection()
+#         cursor = conn.cursor()
+#         for activity in activity_list:
+#             cursor.execute('INSERT INTO activities (activity_name) VALUES (%s)', (activity,))
+#         conn.commit()
+#         conn.close()
+#         return jsonify({'message': 'Activities added successfully'}), 200
+#     except Error as e:
+#         return jsonify({'error': str(e)}), 500
+#     finally:
+#         if conn and conn.is_connected():
+#             conn.close()
+
+
+# def insert_meal_data():
+#     try:
+#         conn = get_db_connection()
+#         cursor = conn.cursor()
+#         # Insert breakfast meals
+#         for meal in breakfast:
+#             meal_option = meal
+#             cursor.execute('INSERT INTO meals (meal_type, meal_option, default_drink) VALUES (%s, %s, %s)',
+#                            ('breakfast', meal_option, breakfast_drink))
+#         # Insert lunch and dinner meals
+#         for meal_type, meals in [('lunch', lunch), ('dinner', dinner)]:
+#             for meal in meals:
+#                 meal_option = meal
+#                 cursor.execute('INSERT INTO meals (meal_type, meal_option) VALUES (%s, %s)',
+#                                (meal_type, meal_option))
+#         conn.commit()
+#     except Error as e:
+#         print(f"Error inserting meal data: {e}")
+#     finally:
+#         if conn and conn.is_connected():
+#             conn.close()
 
 
 if __name__ == '__main__':
-    app.run(host='0.0.0.0')
+    app.run(host='0.0.0.0', debug=False)
+    
+    
+    
