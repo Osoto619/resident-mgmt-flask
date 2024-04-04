@@ -9,7 +9,7 @@ import bcrypt
 from encryption_utils import encrypt_data, decrypt_data
 from datetime import datetime, timedelta
 from urllib.parse import urlparse
-from base_meal_data import breakfast, lunch, dinner , breakfast_drink
+#from base_meal_data import breakfast, lunch, dinner , breakfast_drink
 
 logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s')
 
@@ -849,8 +849,6 @@ def save_adl_data_from_chart():
         if conn.is_connected():
             cursor.close()
             conn.close()
-
-
 
 # --------------------------------- medications Table --------------------------------- #
 
