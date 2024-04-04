@@ -9,7 +9,7 @@ import bcrypt
 from encryption_utils import encrypt_data, decrypt_data
 from datetime import datetime, timedelta
 from urllib.parse import urlparse
-#from base_meal_data import breakfast, lunch, dinner , breakfast_drink
+from base_meal_data import breakfast, lunch, dinner , breakfast_drink
 
 logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s')
 
@@ -72,7 +72,7 @@ def get_db_connection():
             database=jawsdb_url.path[1:],
             port=jawsdb_url.port
         )
-    
+        
     except Error as err:
         print(f"Error: '{err}'")
     return connection
@@ -351,6 +351,60 @@ def get_user_initials():
         if conn and conn.is_connected():
             conn.close()
 
+
+@app.route('/get_all_users', methods=['GET'])
+@jwt_required()
+def get_all_users():
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+
+        cursor.execute("SELECT username FROM users")
+        users = cursor.fetchall()
+
+        # Extract usernames from the query result
+        usernames = [user[0] for user in users]
+
+        return jsonify(usernames), 200
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+    finally:
+        if conn.is_connected():
+            cursor.close()
+            conn.close()
+
+
+@app.route('/remove_user', methods=['POST'])
+@jwt_required()
+def remove_user():
+    # Ensure only admins can remove users
+    username = get_jwt_identity()
+    if not is_user_admin(username):
+        return jsonify({'error': 'Unauthorized: Only admins can remove users.'}), 403
+
+    data = request.get_json()
+    username_to_remove = data['username']
+
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+
+        cursor.execute("DELETE FROM users WHERE username = %s", (username_to_remove,))
+        conn.commit()
+
+        if cursor.rowcount == 0:
+            return jsonify({'error': 'User not found'}), 404
+
+        return jsonify({'message': f'User {username_to_remove} has been removed successfully'}), 200
+    except Exception as e:
+        conn.rollback()
+        return jsonify({'error': str(e)}), 500
+    finally:
+        if conn.is_connected():
+            cursor.close()
+            conn.close()
+
+
 # --------------------------------- audit_logs Table --------------------------------- #
 
 def log_action(username, activity, details):
@@ -596,6 +650,7 @@ def fetch_adl_data_for_resident(resident_name):
             if result:
                 columns = [col[0] for col in cursor.description]
                 adl_data = {columns[i]: result[i] for i in range(3, len(columns))}
+                print(f'adl_data: {adl_data}')
                 return jsonify(adl_data), 200
             else:
                 # Instead of returning an error, return an empty dictionary
@@ -750,6 +805,51 @@ def does_adl_chart_data_exist(resident_name, year_month):
     finally:
         if conn and conn.is_connected():
             conn.close()
+
+
+@app.route('/save_adl_data_from_chart', methods=['POST'])
+@jwt_required()
+def save_adl_data_from_chart():
+    data = request.json
+    resident_name = data['resident_name']
+    adl_data_list = data['adl_data']  # List of dictionaries with 'chart_date' and 'data'
+
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+
+        # Get resident ID
+        resident_id = get_resident_id(resident_name)
+
+        for adl_data in adl_data_list:
+            chart_date = adl_data['chart_date']
+            data_dict = adl_data['data']
+
+            # Construct the SQL statement dynamically based on the data keys
+            keys = data_dict.keys()
+            values_placeholder = ', '.join(['%s'] * (len(keys) + 2))  # +2 for resident_id and chart_date
+            columns = ', '.join(keys)
+            update_clause = ', '.join([f"{key} = VALUES({key})" for key in keys])
+
+            sql = f'''
+                INSERT INTO adl_chart (resident_id, chart_date, {columns})
+                VALUES ({values_placeholder})
+                ON DUPLICATE KEY UPDATE {update_clause}
+            '''
+
+            values = [resident_id, chart_date] + list(data_dict.values())
+            cursor.execute(sql, values)
+
+        conn.commit()
+        return jsonify({'message': 'ADL data saved successfully'}), 200
+    except Exception as e:
+        conn.rollback()
+        return jsonify({'error': str(e)}), 500
+    finally:
+        if conn.is_connected():
+            cursor.close()
+            conn.close()
+
 
 
 # --------------------------------- medications Table --------------------------------- #
