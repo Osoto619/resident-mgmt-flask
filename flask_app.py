@@ -650,7 +650,6 @@ def fetch_adl_data_for_resident(resident_name):
             if result:
                 columns = [col[0] for col in cursor.description]
                 adl_data = {columns[i]: result[i] for i in range(3, len(columns))}
-                print(f'adl_data: {adl_data}')
                 return jsonify(adl_data), 200
             else:
                 # Instead of returning an error, return an empty dictionary
@@ -850,6 +849,8 @@ def save_adl_data_from_chart():
             cursor.close()
             conn.close()
 
+
+
 # --------------------------------- medications Table --------------------------------- #
 
 @app.route('/insert_medication', methods=['POST'])
@@ -1025,7 +1026,7 @@ def filter_active_medications():
                     result = cursor.fetchone()
 
                     # Check if the medication is discontinued and if the discontinuation date is past the current date
-                    if result is None or (result[0] is None or datetime.datetime.now().date() < result[0]):
+                    if result is None or (result[0] is None or datetime.now().date() < result[0]):
                         active_medications.append(med_name)
 
             return jsonify(active_medications=active_medications), 200
@@ -1097,7 +1098,43 @@ def get_controlled_medication_details(resident_name, medication_name):
             conn.close()
 
 
-# -------------------------------- non_medication_orders Table -------------------------------- #
+@app.route('/discontinue_medication', methods=['POST'])
+@jwt_required()
+def discontinue_medication():
+    data = request.get_json()
+    resident_name = data['resident_name']
+    medication_name = data['medication_name']
+    discontinued_date = data['discontinued_date']
+    print(f'Discontinuing medication {medication_name} for {resident_name} as of {discontinued_date}')
+
+    try:
+        conn = get_db_connection()
+        with conn.cursor() as cursor:
+            # Get the resident ID
+            resident_id = get_resident_id(resident_name)
+
+            # Update the medication record with the discontinued date
+            sql = '''
+                UPDATE medications 
+                SET discontinued_date = %s
+                WHERE resident_id = %s AND medication_name = %s
+            '''
+            #print(f'Executing SQL: {sql} with {discontinued_date}, {resident_id}, {medication_name}')
+            cursor.execute(sql, (discontinued_date, resident_id, medication_name))
+            conn.commit()
+
+        return jsonify({'message': f"Medication '{medication_name}' has been discontinued as of {discontinued_date}."}), 200
+    except Exception as e:
+        conn.rollback()
+        print(f"SQL Error: {e}")
+        return jsonify({'error': str(e)}), 500
+    finally:
+        if conn.is_connected():
+            conn.close()
+
+
+
+# -------------------------------------- non_medication_orders Table ------------------------------------- #
 
 @app.route('/add_non_medication_order/<resident_name>', methods=['POST'])
 @jwt_required()
@@ -1175,7 +1212,7 @@ def fetch_all_non_medication_orders(resident_name):
         conn.close()
 
 
-# ----------------------------------- emar_chart Table ----------------------------------------- #
+# --------------------------------------- emar_chart Table ---------------------------------------------- #
 
 @app.route('/fetch_emar_data_for_resident/<resident_name>', methods=['GET'])
 @jwt_required()
@@ -1542,7 +1579,62 @@ def save_controlled_administration():
             conn.close()
 
 
-# -------------------------------- activities Table -------------------------------- #
+@app.route('/save_emar_data_from_chart', methods=['POST'])
+@jwt_required()
+def save_emar_data_from_chart():
+    data = request.get_json()
+    resident_name = data['resident_name']
+    emar_data = data['emar_data']
+
+    try:
+        conn = get_db_connection()
+
+        # Retrieve resident ID
+        with conn.cursor() as cursor:
+            cursor.execute("SELECT id FROM residents WHERE name = %s", (resident_name,))
+            result = cursor.fetchone()
+            if not result:
+                return jsonify({'error': 'Resident not found'}), 404
+            resident_id = result[0]
+            # Clear any remaining results to prevent "Unread result found" error
+            while cursor.nextset():
+                pass
+
+        for entry in emar_data:
+            if entry.get('administered') == 'ADM':  # Skip 'ADM' entries
+                continue
+
+            with conn.cursor() as cursor:
+                medication_name = entry['medication_name']
+                cursor.execute("SELECT id FROM medications WHERE medication_name = %s", (medication_name,))
+                med_result = cursor.fetchone()
+                # Clear any remaining results to prevent "Unread result found" error
+                while cursor.nextset():
+                    pass
+                if not med_result:
+                    continue  # Skip if medication not found
+                medication_id = med_result[0]
+
+                sql = '''
+                    INSERT INTO emar_chart (resident_id, medication_id, chart_date, time_slot, administered)
+                    VALUES (%s, %s, %s, %s, %s)
+                    ON DUPLICATE KEY UPDATE administered = VALUES(administered)
+                '''
+                cursor.execute(sql, (resident_id, medication_id, entry['chart_date'], entry['time_slot'], entry['administered']))
+                conn.commit()
+
+        return jsonify({'message': 'eMAR data saved successfully'}), 200
+    except Exception as e:
+        conn.rollback()
+        return jsonify({'error': str(e)}), 500
+    finally:
+        if conn.is_connected():
+            conn.close()
+
+
+
+
+# ----------------------------------- activities Table ------------------------------------ #
 
 @app.route('/fetch_activities', methods=['GET'])
 def fetch_activities():
