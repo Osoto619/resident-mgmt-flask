@@ -1007,29 +1007,36 @@ def fetch_medications_for_resident(resident_name):
 @app.route('/filter_active_medications', methods=['POST'])
 @jwt_required()
 def filter_active_medications():
-    # Assuming you're receiving a list of medication names and a resident name in the request JSON
     data = request.get_json()
     medication_names = data.get('medication_names', [])
     resident_name = data.get('resident_name', '')
     active_medications = []
 
+    if not medication_names:
+        # If no medication names are provided, return an empty list immediately
+        return jsonify(active_medications=[]), 200
+
     try:
         conn = get_db_connection()
-        if conn is not None:
-            with conn.cursor() as cursor:
-                for med_name in medication_names:
-                    cursor.execute('''
-                        SELECT discontinued_date FROM medications
-                        JOIN residents ON medications.resident_id = residents.id
-                        WHERE residents.name = %s AND medications.medication_name = %s
-                    ''', (resident_name, med_name))
-                    result = cursor.fetchone()
+        with conn.cursor() as cursor:
+            # Build the IN clause dynamically based on the number of medication names
+            in_placeholders = ', '.join(['%s'] * len(medication_names))
+            query = '''
+                SELECT medication_name, discontinued_date FROM medications
+                JOIN residents ON medications.resident_id = residents.id
+                WHERE residents.name = %s AND medications.medication_name IN ({})
+            '''.format(in_placeholders)
+            params = [resident_name] + medication_names
+            cursor.execute(query, params)
+            results = cursor.fetchall()
 
-                    # Check if the medication is discontinued and if the discontinuation date is past the current date
-                    if result is None or (result[0] is None or datetime.now().date() < result[0]):
-                        active_medications.append(med_name)
+            # Check if the medication is discontinued and if the discontinuation date is past the current date
+            for result in results:
+                med_name, discontinued_date = result
+                if discontinued_date is None or datetime.now().date() < discontinued_date:
+                    active_medications.append(med_name)
 
-            return jsonify(active_medications=active_medications), 200
+        return jsonify(active_medications=active_medications), 200
     except Exception as e:
         return jsonify({'error': str(e)}), 500
     finally:
