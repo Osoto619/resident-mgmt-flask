@@ -1004,6 +1004,38 @@ def fetch_medications_for_resident(resident_name):
     return jsonify(medications_data)
 
 
+# @app.route('/filter_active_medications', methods=['POST'])
+# @jwt_required()
+# def filter_active_medications():
+#     # Assuming you're receiving a list of medication names and a resident name in the request JSON
+#     data = request.get_json()
+#     medication_names = data.get('medication_names', [])
+#     resident_name = data.get('resident_name', '')
+#     active_medications = []
+
+#     try:
+#         conn = get_db_connection()
+#         if conn is not None:
+#             with conn.cursor() as cursor:
+#                 for med_name in medication_names:
+#                     cursor.execute('''
+#                         SELECT discontinued_date FROM medications
+#                         JOIN residents ON medications.resident_id = residents.id
+#                         WHERE residents.name = %s AND medications.medication_name = %s
+#                     ''', (resident_name, med_name))
+#                     result = cursor.fetchone()
+
+#                     # Check if the medication is discontinued and if the discontinuation date is past the current date
+#                     if result is None or (result[0] is None or datetime.now().date() < result[0]):
+#                         active_medications.append(med_name)
+
+#             return jsonify(active_medications=active_medications), 200
+#     except Exception as e:
+#         return jsonify({'error': str(e)}), 500
+#     finally:
+#         if conn.is_connected():
+#             conn.close()
+
 @app.route('/filter_active_medications', methods=['POST'])
 @jwt_required()
 def filter_active_medications():
@@ -1042,6 +1074,7 @@ def filter_active_medications():
     finally:
         if conn.is_connected():
             conn.close()
+
 
 
 @app.route('/fetch_all_non_medication_orders_for_resident/<resident_name>', methods=['GET'])
@@ -1862,6 +1895,39 @@ def remove_meal(meal_type):
 
 # -------------------------------------- documents Table ----------------------------------------------- #
 
+@app.route('/fetch_employee_documents', methods=['GET'])
+@jwt_required()
+def fetch_employee_documents():
+    try:
+        conn = get_db_connection()
+        with conn.cursor() as cursor:
+            cursor.execute("SELECT document_name, expiration_interval FROM documents WHERE category = 'Employee'")
+            documents = cursor.fetchall()
+            document_details = {doc[0]: doc[1] if doc[1] is not None else '' for doc in documents}
+        return jsonify(document_details=document_details), 200
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+    finally:
+        if conn.is_connected():
+            conn.close()
+
+
+@app.route('/fetch_facility_documents', methods=['GET'])
+@jwt_required()
+def fetch_facility_documents():
+    try:
+        conn = get_db_connection()
+        with conn.cursor() as cursor:
+            cursor.execute("SELECT document_name, expiration_interval FROM documents WHERE category = 'Facility'")
+            documents = cursor.fetchall()
+            document_details = {doc[0]: doc[1] if doc[1] is not None else '' for doc in documents}
+        return jsonify(document_details=document_details), 200
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+    finally:
+        if conn.is_connected():
+            conn.close()
+
 
 # -------------------------------------- tracked_items Table ------------------------------------------- #
 
@@ -1959,6 +2025,85 @@ def fetch_employee_tracked_items():
         return jsonify(employee_tracked_items), 200
 
     except Exception as e:
+        return jsonify({'error': str(e)}), 500
+    finally:
+        if conn.is_connected():
+            conn.close()
+
+
+@app.route('/fetch_facility_tracked_items', methods=['GET'])
+@jwt_required()
+def fetch_facility_tracked_items():
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+
+        sql = '''
+            SELECT d.document_name, ti.document_date, ti.expiration_date, ti.document_status
+            FROM tracked_items ti
+            JOIN documents d ON ti.document_id = d.document_id
+            WHERE ti.category_type = 'Facility'
+        '''
+        cursor.execute(sql)
+        result = cursor.fetchall()
+
+        facility_tracked_items = [{
+            'document_name': row[0],
+            'certification_date': row[1].strftime('%Y-%m-%d'),
+            'expiration_date': row[2].strftime('%Y-%m-%d'),
+            'status': row[3]
+        } for row in result]
+
+        return jsonify(facility_tracked_items), 200
+
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+    finally:
+        if conn.is_connected():
+            conn.close()
+
+
+@app.route('/add_tracked_item_facility', methods=['POST'])
+@jwt_required()
+def add_tracked_item_facility():
+    data = request.get_json()
+    document_name = data['document_name']
+    custom_document_name = data.get('custom_document_name')
+    expiration_interval = data.get('expiration_interval')
+    certification_date = data['certification_date']
+    reminder_days_before_expiration = data['reminder_days_before_expiration']
+
+    try:
+        conn = get_db_connection()
+        with conn.cursor() as cursor:
+            if custom_document_name:
+                # Insert custom document into documents table if it doesn't already exist
+                cursor.execute(
+                    "INSERT INTO documents (document_name, expiration_interval, is_custom, category) VALUES (%s, %s, TRUE, 'Facility') ON DUPLICATE KEY UPDATE expiration_interval = VALUES(expiration_interval)",
+                    (custom_document_name, expiration_interval)
+                )
+                document_id = cursor.lastrowid
+            else:
+                # Fetch document_id for predefined documents
+                cursor.execute("SELECT document_id FROM documents WHERE document_name = %s AND category = 'Facility'", (document_name,))
+                result = cursor.fetchone()
+                if result:
+                    document_id = result[0]
+                else:
+                    return jsonify({'error': 'Document not found'}), 404
+
+            expiration_date = calculate_expiration_date(certification_date, expiration_interval)
+            
+            # Insert into tracked_items table
+            cursor.execute(
+                "INSERT INTO tracked_items (document_id, document_date, expiration_date, reminder_days_before_expiration, document_status, pertains_to, category_type) VALUES (%s, %s, %s, %s, 'valid', NULL, 'Facility')",
+                (document_id, certification_date, expiration_date, reminder_days_before_expiration)
+            )
+            conn.commit()
+
+        return jsonify({'message': 'Tracked item added successfully'}), 200
+    except Exception as e:
+        conn.rollback()
         return jsonify({'error': str(e)}), 500
     finally:
         if conn.is_connected():
