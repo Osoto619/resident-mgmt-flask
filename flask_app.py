@@ -73,6 +73,7 @@ def get_db_connection():
             port=jawsdb_url.port
         )
         
+        
     except Error as err:
         print(f"Error: '{err}'")
     return connection
@@ -1948,6 +1949,37 @@ def calculate_expiration_date(certification_date, expiration_interval):
     certification_date_dt = datetime.strptime(certification_date, "%Y-%m-%d")
     expiration_date_dt = certification_date_dt + timedelta(days=int(expiration_interval))
     return expiration_date_dt.strftime("%Y-%m-%d")
+
+
+@app.route('/dashboard_data', methods=['GET'])
+@jwt_required()
+def get_dashboard_data():
+    today = datetime.now().date()
+    thirty_days_later = today + timedelta(days=30)
+    
+    try:
+        conn = get_db_connection()
+        with conn.cursor() as cursor:
+            # Count items expiring within the next 30 days
+            cursor.execute("""
+                SELECT COUNT(*) FROM tracked_items 
+                WHERE expiration_date BETWEEN %s AND %s
+                """, (today, thirty_days_later))
+            upcoming_renewals = cursor.fetchone()[0]
+
+            # Count items due today or overdue
+            cursor.execute("""
+                SELECT COUNT(*) FROM tracked_items 
+                WHERE expiration_date <= %s
+                """, (today,))
+            immediate_renewals = cursor.fetchone()[0]
+
+        return jsonify(upcoming_renewals=upcoming_renewals, immediate_renewals=immediate_renewals), 200
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+    finally:
+        if conn.is_connected():
+            conn.close()
 
 
 @app.route('/add_tracked_item_employee', methods=['POST'])
