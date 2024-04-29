@@ -73,7 +73,6 @@ def get_db_connection():
             port=jawsdb_url.port
         )
         
-        
     except Error as err:
         print(f"Error: '{err}'")
     return connection
@@ -406,7 +405,7 @@ def remove_user():
             conn.close()
 
 
-# -------------------------------------- audit_logs Table --------------------------------- #
+# ------------------------------------------- audit_logs Table ----------------------------------- #
 
 def log_action(username, activity, details):
     current_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
@@ -632,7 +631,7 @@ def remove_resident():
             conn.close()
 
 
-# --------------------------------- adl_chart Table --------------------------------- #
+# ------------------------------------ adl_chart Table ------------------------------------ #
 
 @app.route('/fetch_adl_data_for_resident/<resident_name>', methods=['GET'])
 @jwt_required()
@@ -852,7 +851,7 @@ def save_adl_data_from_chart():
 
 
 
-# --------------------------------- medications Table --------------------------------- #
+# -------------------------------------- medications Table ----------------------------------- #
 
 @app.route('/insert_medication', methods=['POST'])
 @jwt_required()
@@ -1307,8 +1306,85 @@ def fetch_all_non_medication_orders(resident_name):
         cursor.close()
         conn.close()
 
+# ---------------------------------------- non_med_order_administrations Table ------------------------------------- #
 
-# --------------------------------------- emar_chart Table ---------------------------------------------- #
+@app.route('/record_non_med_order_performance', methods=['POST'])
+@jwt_required()
+def record_non_med_order_performance():
+    current_user = get_jwt_identity()
+    data = request.get_json()
+    order_name = data['order_name']
+    resident_name = data['resident_name']
+    notes = data['notes']
+    initials = data['initials']
+
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+
+        resident_id = get_resident_id(resident_name)
+        cursor.execute("SELECT order_id FROM non_medication_orders WHERE order_name = %s AND resident_id = %s", (order_name, resident_id))
+        order_result = cursor.fetchone()
+        if not order_result:
+            return jsonify({"error": "Order not found"}), 404
+        order_id = order_result[0]
+
+        current_date = datetime.now().strftime('%Y-%m-%d')
+        cursor.execute("INSERT INTO non_med_order_administrations (order_id, resident_id, administration_date, notes, initials) VALUES (%s, %s, %s, %s, %s)", (order_id, resident_id, current_date, notes, initials))
+        cursor.execute("UPDATE non_medication_orders SET last_administered_date = %s WHERE order_id = %s", (current_date, order_id))
+
+        conn.commit()
+        return jsonify({"message": "Non-medication order performance recorded successfully"}), 200
+    except Exception as e:
+        conn.rollback()
+        return jsonify({'error': str(e)}), 500
+    finally:
+        if conn.is_connected():
+            cursor.close()
+            conn.close()
+
+@app.route('/fetch_non_med_orders_for_resident', methods=['POST'])
+@jwt_required()
+def fetch_non_med_orders_for_resident():
+    data = request.get_json()
+    resident_name = data['resident_name']
+
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+
+        # Fetch resident_id using the helper function
+        resident_id = get_resident_id(resident_name)
+
+        # Execute the query using the resident_id
+        cursor.execute('''
+            SELECT non_medication_orders.order_name, non_med_order_administrations.administration_date, non_med_order_administrations.notes, non_med_order_administrations.initials
+            FROM non_medication_orders
+            JOIN non_med_order_administrations ON non_medication_orders.order_id = non_med_order_administrations.order_id
+            WHERE non_medication_orders.resident_id = %s
+            ORDER BY non_med_order_administrations.administration_date DESC
+        ''', (resident_id,))
+        orders = cursor.fetchall()
+
+        non_med_orders = {}
+        for row in orders:
+            order_name = row[0]
+            if order_name not in non_med_orders:
+                non_med_orders[order_name] = []
+            non_med_orders[order_name].append([row[1], row[2], row[3]])
+
+        non_med_orders_list = [{'order_name': order_name, 'details': details} for order_name, details in non_med_orders.items()]
+        return jsonify(non_med_orders=non_med_orders_list), 200
+
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+    finally:
+        if conn.is_connected():
+            cursor.close()
+            conn.close()
+
+
+# ------------------------------------------- emar_chart Table ---------------------------------------------------- #
 
 @app.route('/fetch_emar_data_for_resident/<resident_name>', methods=['GET'])
 @jwt_required()
