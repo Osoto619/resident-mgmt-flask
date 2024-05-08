@@ -600,7 +600,10 @@ def remove_resident():
         # Delete related EMAR data
         cursor.execute("DELETE FROM emar_chart WHERE resident_id = %s", (resident_id,))
 
-        # Delete related non medication orders
+        # Delete related non-med order administrations
+        cursor.execute("DELETE FROM non_med_order_administrations WHERE resident_id = %s", (resident_id,))
+
+        # Delete related non-medication orders
         cursor.execute("DELETE FROM non_medication_orders WHERE resident_id = %s", (resident_id,))
 
         # Before deleting medications, delete entries from medication_time_slots
@@ -613,8 +616,6 @@ def remove_resident():
         # Delete related medications
         cursor.execute("DELETE FROM medications WHERE resident_id = %s", (resident_id,))
 
-        # Add more DELETE statements for other related tables as needed
-
         # Finally, delete the resident
         cursor.execute("DELETE FROM residents WHERE id = %s", (resident_id,))
         
@@ -622,6 +623,147 @@ def remove_resident():
         conn.commit()
         log_action(username, 'Resident Removed', f'Resident Removed {resident_name}')
         return jsonify({'message': f'Resident {resident_name} has been removed successfully'}), 200
+    except Error as e:
+        conn.rollback()
+        return jsonify({'error': str(e)}), 500
+    finally:
+        if conn.is_connected():
+            cursor.close()
+            conn.close()
+
+
+@app.route('/fetch_resident_information', methods=['POST'])
+def fetch_resident_information():
+    data = request.get_json()
+    resident_name = data['resident_name']
+
+    try:
+        conn = get_db_connection()
+        with conn.cursor() as cursor:
+            cursor.execute("SELECT name, date_of_birth FROM residents WHERE name = %s", (resident_name,))
+            result = cursor.fetchone()
+            if result:
+                name, encrypted_date_of_birth = result
+                decrypted_date_of_birth = decrypt_data(encrypted_date_of_birth) if encrypted_date_of_birth else None
+                return jsonify({'name': name, 'date_of_birth': decrypted_date_of_birth}), 200
+            else:
+                return jsonify({'message': 'Resident not found'}), 404
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+    finally:
+        if conn and conn.is_connected():
+            conn.close()
+
+
+@app.route('/update_resident_info', methods=['POST'])
+@jwt_required()
+def update_resident_info():
+    data = request.get_json()
+    old_name = data['old_name']
+    new_name = data['new_name']
+    new_dob = data['new_dob']
+    
+    # Encrypt the new DOB before storing it
+    encrypted_new_dob = encrypt_data(new_dob)
+
+    try:
+        conn = get_db_connection()
+        with conn.cursor() as cursor:
+            cursor.execute("UPDATE residents SET name = %s, date_of_birth = %s WHERE name = %s", (new_name, encrypted_new_dob, old_name))
+            conn.commit()
+            if cursor.rowcount == 0:
+                return jsonify({'error': 'No resident found or data is the same as existing'}), 404
+            return jsonify({'message': 'Resident information updated successfully'}), 200
+    except Exception as e:
+        conn.rollback()
+        return jsonify({'error': str(e)}), 500
+    finally:
+        if conn.is_connected():
+            conn.close()
+
+
+@app.route('/fetch_active_residents', methods=['GET'])
+def fetch_active_residents():
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("SELECT name FROM residents WHERE is_active = TRUE")
+        active_residents = [row[0] for row in cursor.fetchall()]
+        return jsonify(active_residents=active_residents), 200
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+    finally:
+        if conn.is_connected():
+            cursor.close()
+            conn.close()
+
+
+@app.route('/deactivate_resident', methods=['POST'])
+@jwt_required()
+def deactivate_resident():
+    data = request.get_json()
+    resident_name = data['resident_name']
+    username = get_jwt_identity()
+
+    if not is_user_admin(username):
+        return jsonify({'error': 'Unauthorized: Only admins can deactivate residents.'}), 403
+
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+
+        # Get resident_id
+        resident_id = get_resident_id(resident_name)
+        deactivation_date = datetime.now().strftime('%Y-%m-%d')
+
+        # Update the resident's is_active status and set the deactivation_date
+        cursor.execute("""
+            UPDATE residents
+            SET is_active = %s, deactivation_date = %s
+            WHERE id = %s
+        """, (False, deactivation_date, resident_id))
+
+        conn.commit()
+        log_action(username, 'Deactivate Resident', f'Resident {resident_name} deactivated.')
+        return jsonify({'message': f'Resident {resident_name} has been successfully deactivated.'}), 200
+
+    except Error as e:
+        conn.rollback()
+        return jsonify({'error': str(e)}), 500
+    finally:
+        if conn.is_connected():
+            cursor.close()
+            conn.close()
+
+
+@app.route('/reactivate_resident', methods=['POST'])
+@jwt_required()
+def reactivate_resident():
+    data = request.get_json()
+    resident_name = data['resident_name']
+    username = get_jwt_identity()
+
+    if not is_user_admin(username):
+        return jsonify({'error': 'Unauthorized: Only admins can reactivate residents.'}), 403
+
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+
+        # Get resident_id
+        resident_id = get_resident_id(resident_name)
+
+        # Update the resident's is_active status and clear the deactivation_date
+        cursor.execute("""
+            UPDATE residents
+            SET is_active = %s, deactivation_date = NULL
+            WHERE id = %s
+        """, (True, resident_id))
+
+        conn.commit()
+        log_action(username, 'Reactivate Resident', f'Resident {resident_name} reactivated.')
+        return jsonify({'message': f'Resident {resident_name} has been successfully reactivated.'}), 200
+
     except Error as e:
         conn.rollback()
         return jsonify({'error': str(e)}), 500
