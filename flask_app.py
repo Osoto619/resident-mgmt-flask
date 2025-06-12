@@ -117,24 +117,30 @@ def save_user_preferences():
 
 @app.route('/get_user_preferences', methods=['GET'])
 def get_user_preferences():
+    conn = None
+    cursor = None
     try:
         conn = get_db_connection()
-        with conn.cursor() as cursor:
-            preferences = {'theme': 'Reddit', 'font': 'Helvetica'}  # Default values
+        cursor = conn.cursor()
 
-            cursor.execute("SELECT setting_name, setting_value FROM user_settings WHERE setting_name IN ('theme', 'font')")
-            results = cursor.fetchall()
+        preferences = {'theme': 'Reddit', 'font': 'Helvetica'}  # Default values
 
-            for setting_name, setting_value in results:
-                if setting_name in preferences:
-                    preferences[setting_name] = setting_value
+        cursor.execute("SELECT setting_name, setting_value FROM user_settings WHERE setting_name IN ('theme', 'font')")
+        results = cursor.fetchall()
+
+        for setting_name, setting_value in results:
+            if setting_name in preferences:
+                preferences[setting_name] = setting_value
 
         return jsonify(preferences), 200
     except Exception as e:
         return jsonify({'error': str(e)}), 500
     finally:
-        if conn.is_connected():
+        if cursor:
+            cursor.close()
+        if conn and conn.is_connected():
             conn.close()
+
 
 
 # ---------------------------------- users Table --------------------------------------- #
@@ -1381,23 +1387,43 @@ def save_non_medication_order(resident_name):
     if not resident_id:
         return jsonify({'error': 'Resident not found'}), 404
 
-    order_name = data.get('order_name')
-    frequency = data.get('frequency', '')
-    specific_days = data.get('specific_days', '')
-    instructions = data.get('instructions')
+    # Required fields
+    order_name     = data.get('order_name', '').strip()
+    instructions   = data.get('instructions', '').strip()
 
-    # Validate input
+    # Scheduling fields
+    frequency      = data.get('frequency', '')         # can be '' if using specific_days
+    specific_days  = data.get('specific_days', '')     # can be '' if using frequency
+    times_per_day  = data.get('times_per_day', 1)      # new field
+
+    # Validate
     if not order_name:
         return jsonify({'error': 'Order name is required'}), 400
 
+    try:
+        # Ensure times_per_day is a positive integer
+        times_per_day = int(times_per_day)
+        if times_per_day < 1:
+            raise ValueError()
+    except ValueError:
+        return jsonify({'error': 'times_per_day must be a positive integer'}), 400
+
     conn = get_db_connection()
     cursor = conn.cursor()
-
     try:
         cursor.execute('''
-            INSERT INTO non_medication_orders (resident_id, order_name, frequency, specific_days, special_instructions)
-            VALUES (%s, %s, %s, %s, %s)
-        ''', (resident_id, order_name, frequency, specific_days, instructions))
+            INSERT INTO non_medication_orders
+              (resident_id, order_name, frequency, specific_days,
+               times_per_day, special_instructions)
+            VALUES (%s, %s, %s, %s, %s, %s)
+        ''', (
+            resident_id,
+            order_name,
+            frequency,
+            specific_days,
+            times_per_day,
+            instructions
+        ))
         conn.commit()
     except Exception as e:
         conn.rollback()
@@ -1406,42 +1432,101 @@ def save_non_medication_order(resident_name):
         cursor.close()
         conn.close()
 
-    # Log the action 
-    log_action(get_jwt_identity(), 'Add Non-Medication Order', f'Order for {resident_name}: {order_name}')
+    # Audit log
+    log_action(
+        get_jwt_identity(),
+        'Add Non-Medication Order',
+        f'Order for {resident_name}: {order_name} ' +
+        f'(every {frequency or "N/A"} days on {specific_days or "all days"}, ' +
+        f'{times_per_day}×/day)'
+    )
 
     return jsonify({'message': 'Non-medication order added successfully'}), 200
 
 
+# @app.route('/fetch_non_medication_orders/<resident_name>', methods=['GET'])
+# @jwt_required()
+# def fetch_all_non_medication_orders(resident_name):
+#     resident_id = get_resident_id(resident_name)
+#     if not resident_id:
+#         return jsonify({'error': f'Resident {resident_name} not found'}), 404
+
+#     conn = get_db_connection()
+#     cursor = conn.cursor(dictionary=True)
+    
+#     try:
+#         cursor.execute('''
+#             SELECT
+#                 order_id,
+#                 order_name,
+#                 frequency,
+#                 specific_days,
+#                 times_per_day,                   -- <-- include new column
+#                 special_instructions,
+#                 discontinued_date,
+#                 last_administered_date
+#             FROM non_medication_orders
+#             WHERE resident_id = %s
+#         ''', (resident_id,))
+#         orders = cursor.fetchall()
+
+#         non_medication_orders = []
+#         for order in orders:
+#             non_medication_orders.append({
+#                 'order_id': order['order_id'],
+#                 'order_name': order['order_name'],
+#                 'frequency': order['frequency'],
+#                 'specific_days': order['specific_days'],
+#                 'times_per_day': order['times_per_day'],       # <-- new field here
+#                 'special_instructions': order['special_instructions'],
+#                 'discontinued_date': (order['discontinued_date']
+#                                       if order['discontinued_date'] else None),
+#                 'last_administered_date': (order['last_administered_date']
+#                                            if order['last_administered_date'] else None),
+#             })
+
+#         return jsonify(non_medication_orders), 200
+
+#     except Exception as e:
+#         return jsonify({'error': str(e)}), 500
+
+#     finally:
+#         cursor.close()
+#         conn.close()
 @app.route('/fetch_non_medication_orders/<resident_name>', methods=['GET'])
 @jwt_required()
 def fetch_all_non_medication_orders(resident_name):
     resident_id = get_resident_id(resident_name)
     if not resident_id:
-        return jsonify({'error': f'Resident {resident_name} not found'}), 404
+        return jsonify({'error': 'Resident not found'}), 404
 
     conn = get_db_connection()
     cursor = conn.cursor(dictionary=True)
-    
     try:
         cursor.execute('''
-            SELECT order_id, order_name, frequency, specific_days, special_instructions, discontinued_date, last_administered_date
-            FROM non_medication_orders
-            WHERE resident_id = %s
+            SELECT
+              o.order_id,
+              o.order_name,
+              o.frequency,
+              o.specific_days,
+              o.times_per_day,
+              o.special_instructions,
+              o.discontinued_date,
+              o.last_administered_date,
+              -- subquery to count today’s runs
+              COALESCE((
+                SELECT COUNT(*) 
+                FROM non_med_order_administrations a
+                WHERE a.order_id = o.order_id
+                  AND a.administration_date = CURDATE()
+              ),0) AS done_today
+            FROM non_medication_orders AS o
+            WHERE o.resident_id = %s;
         ''', (resident_id,))
+
         orders = cursor.fetchall()
+        return jsonify(orders), 200
 
-        # Prepare and return the list of orders
-        non_medication_orders = [{
-            'order_id': order['order_id'],
-            'order_name': order['order_name'],
-            'frequency': order['frequency'],
-            'specific_days': order['specific_days'],
-            'special_instructions': order['special_instructions'],
-            'discontinued_date': order['discontinued_date'] if order['discontinued_date'] else None,
-            'last_administered_date': order['last_administered_date'] if order['last_administered_date'] else None,
-        } for order in orders]
-
-        return jsonify(non_medication_orders), 200
     except Exception as e:
         return jsonify({'error': str(e)}), 500
     finally:
@@ -2407,7 +2492,7 @@ def add_tracked_item_facility():
 
 
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', debug=False)
+    app.run(host='0.0.0.0', debug=True)
     
     
     
