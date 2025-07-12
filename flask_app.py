@@ -15,8 +15,9 @@ logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %
 
 app = Flask(__name__)
 
-# Ensure you have a secret key set for JWT to use
+
 app.config['JWT_SECRET_KEY'] = 'fSdas23#%@adY'  # Change this!
+app.config['JWT_ACCESS_TOKEN_EXPIRES'] = timedelta(hours=1)   # now tokens last 1 hours
 
 jwt = JWTManager(app)  # Initialize Flask-JWT-Extended with your Flask app
 
