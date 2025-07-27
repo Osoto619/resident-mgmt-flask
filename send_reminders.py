@@ -19,23 +19,39 @@ def main():
 
     # ——— 1) EXPIRED ITEMS ———
     cursor.execute("""
-      SELECT item_id, pertains_to, d.document_name, expiration_date
-        FROM tracked_items ti
-        JOIN documents d ON ti.document_id = d.document_id
-       WHERE ti.email_sent = 0
-         AND ti.expiration_date < CURDATE()
+      SELECT
+        ti.item_id,
+        ti.pertains_to,
+        ti.category_type,
+        ti.facility_id,
+        d.document_name,
+        ti.expiration_date,
+        f.facility_name
+      FROM tracked_items ti
+      JOIN documents d ON ti.document_id = d.document_id
+      JOIN facilities f ON ti.facility_id = f.facility_id
+     WHERE ti.email_sent = 0
+       AND ti.expiration_date < CURDATE()
     """)
     expired = cursor.fetchall()
+
     for row in expired:
-        subject = f"⚠️ ALERT: {row['document_name']} expired on {row['expiration_date']}"
-        body    = (
+        # Build subject/body
+        base = (
             f"{row['pertains_to']}'s {row['document_name']} "
-            f"expired on {row['expiration_date']}. Please take action."
+            f"expired on {row['expiration_date']}"
         )
-        msg = Mail(from_email=from_email,
-                   to_emails=to_emails,
-                   subject=subject,
-                   html_content=body)
+        if row['category_type'] in ('Resident', 'Facility'):
+            base += f" (Facility: {row['facility_name']})"
+        subject = f"⚠️ ALERT: {base}"
+        body = f"{base}.  Please take action."
+
+        msg = Mail(
+            from_email=from_email,
+            to_emails=to_emails,
+            subject=subject,
+            html_content=body
+        )
         try:
             sg.send(msg)
             cursor.execute(
@@ -49,25 +65,41 @@ def main():
 
     # ——— 2) UPCOMING REMINDERS ———
     cursor.execute("""
-      SELECT item_id, pertains_to, d.document_name, expiration_date,
-             reminder_days_before_expiration
-        FROM tracked_items ti
-        JOIN documents d ON ti.document_id = d.document_id
-       WHERE ti.email_sent = 0
-         AND ti.expiration_date = CURDATE() + INTERVAL ti.reminder_days_before_expiration DAY
+      SELECT
+        ti.item_id,
+        ti.pertains_to,
+        ti.category_type,
+        ti.facility_id,
+        d.document_name,
+        ti.expiration_date,
+        ti.reminder_days_before_expiration,
+        f.facility_name
+      FROM tracked_items ti
+      JOIN documents d ON ti.document_id = d.document_id
+      JOIN facilities f ON ti.facility_id = f.facility_id
+     WHERE ti.email_sent = 0
+       AND ti.expiration_date = CURDATE() + INTERVAL ti.reminder_days_before_expiration DAY
     """)
     upcoming = cursor.fetchall()
+
     for row in upcoming:
-        subject = f"📌 Reminder: {row['document_name']} expires on {row['expiration_date']}"
-        body    = (
+        # Build subject/body
+        base = (
             f"{row['pertains_to']}'s {row['document_name']} "
-            f"will expire on {row['expiration_date']} (in "
-            f"{row['reminder_days_before_expiration']} days)."
+            f"will expire on {row['expiration_date']} "
+            f"(in {row['reminder_days_before_expiration']} days)"
         )
-        msg = Mail(from_email=from_email,
-                   to_emails=to_emails,
-                   subject=subject,
-                   html_content=body)
+        if row['category_type'] in ('Resident', 'Facility'):
+            base += f" at {row['facility_name']}"
+        subject = f"📌 Reminder: {base}"
+        body = base + "."
+
+        msg = Mail(
+            from_email=from_email,
+            to_emails=to_emails,
+            subject=subject,
+            html_content=body
+        )
         try:
             sg.send(msg)
             cursor.execute(
