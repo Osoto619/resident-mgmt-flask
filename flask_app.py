@@ -509,134 +509,216 @@ def get_resident_count():
         return jsonify({'error': str(e)}), 500
 
 
-@app.route('/get_resident_names', methods=['GET'])
+@app.route('/get_resident_names/<int:facility_id>', methods=['GET'])
 @jwt_required()
-def get_resident_names():
+def get_resident_names(facility_id):
     try:
         conn = get_db_connection()
-        if conn is not None:
-            cursor = conn.cursor()
-            cursor.execute('SELECT name FROM residents')
-            names = [row[0] for row in cursor.fetchall()]
-            conn.close()
-            return jsonify({'names': names}), 200
-        else:
-            return jsonify({'error': 'Failed to connect to the database'}), 500
+        cursor = conn.cursor()
+
+        # Only pull residents belonging to this facility
+        cursor.execute(
+            "SELECT name "
+            "FROM residents "
+            "WHERE facility_id = %s",
+            (facility_id,)
+        )
+        names = [row[0] for row in cursor.fetchall()]
+        return jsonify({'names': names}), 200
+
     except Error as e:
         return jsonify({'error': str(e)}), 500
 
+    finally:
+        cursor.close()
+        conn.close()
 
-@app.route('/get_resident_care_level', methods=['GET'])
+
+@app.route('/fetch_all_active_residents', methods=['GET'])
 @jwt_required()
-def get_resident_care_level():
+def fetch_all_active_residents():
+    """
+    Return the names of every active resident, regardless of facility.
+    """
     try:
         conn = get_db_connection()
-        if conn is not None:
-            cursor = conn.cursor()
-            cursor.execute('SELECT name, level_of_care FROM residents')
-            results = cursor.fetchall()
-            decrypted_results = []
-            for row in results:
-                try:
-                    decrypted_care_level = decrypt_data(row[1])
-                except Exception as decrypt_error:
-                    print(f"Error decrypting care level for {row[0]}: {decrypt_error}")
-                    decrypted_care_level = "Error"  # or use a default value or skip
-                decrypted_results.append({'name': row[0], 'level_of_care': decrypted_care_level})
-            return jsonify({'residents': decrypted_results}), 200
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT name "
+            "FROM residents "
+            "WHERE is_active = TRUE"
+        )
+        names = [row[0] for row in cursor.fetchall()]
+        return jsonify({'active_residents': names}), 200
     except Error as e:
         return jsonify({'error': str(e)}), 500
     finally:
-        if conn:
-            conn.close()
+        cursor.close()
+        conn.close()
+
+
+@app.route('/get_resident_care_level/<int:facility_id>', methods=['GET'])
+@jwt_required()
+def get_resident_care_level(facility_id):
+    """
+    Return each resident’s level_of_care for the given facility_id.
+    """
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+
+        cursor.execute(
+            """
+            SELECT name, level_of_care
+              FROM residents
+             WHERE facility_id = %s
+            """,
+            (facility_id,)
+        )
+        # build list of dicts: [{'name': ..., 'level_of_care': ...}, ...]
+        rows = cursor.fetchall()
+        residents = [{'name': r[0], 'level_of_care': r[1]} for r in rows]
+
+        return jsonify({'residents': residents}), 200
+
+    except Error as e:
+        return jsonify({'error': str(e)}), 500
+
+    finally:
+        cursor.close()
+        conn.close()
 
 
 @app.route('/insert_resident', methods=['POST'])
 @jwt_required()
 def insert_resident():
-    data = request.json
+    data = request.get_json()
     username = get_jwt_identity()
-    name = data.get('name')
-    date_of_birth = data.get('date_of_birth')
-    level_of_care = data.get('level_of_care')
 
-    admin_check = is_user_admin(username)
-    if not admin_check:
+    if not is_user_admin(username):
         return jsonify({'error': 'Unauthorized - Admin role required'}), 403
-    
-    encrypted_dob = encrypt_data(date_of_birth)
-    encrypted_level_of_care = encrypt_data(level_of_care)
 
-    try :
+    name = data.get('name')
+    dob = data.get('date_of_birth')
+    level = data.get('level_of_care')
+    facility = data.get('facility_id')
+
+    if not all([name, dob, level, facility]):
+        return jsonify({'error': 'Missing required fields'}), 400
+
+    enc_dob = encrypt_data(dob)
+    enc_level = encrypt_data(level)
+
+    try:
         conn = get_db_connection()
-        if conn is not None:
-            cursor = conn.cursor()
-            cursor.execute('INSERT INTO residents (name, date_of_birth, level_of_care) VALUES (%s, %s, %s)', (name, encrypted_dob, encrypted_level_of_care))
-            conn.commit()
-            conn.close()
-            log_action(username, 'Resident Added', f'Resident Added {name}')
-            return jsonify({'message': 'Resident added successfully'}), 201
-        else:
-            return jsonify({'error': 'Failed to connect to the database'}), 500
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            INSERT INTO residents (facility_id, name, date_of_birth, level_of_care)
+            VALUES (%s, %s, %s, %s)
+            """,
+            (facility, name, enc_dob, enc_level)
+        )
+        conn.commit()
+        log_action(username, 'Resident Added', f'Resident Added {name} (Facility {facility})')
+        return jsonify({'message': 'Resident added successfully'}), 201
+
     except Error as e:
-        print(f"Database error: {e}")
+        conn.rollback()
         return jsonify({'error': str(e)}), 500
 
+    finally:
+        cursor.close()
+        conn.close()
 
 @app.route('/remove_resident', methods=['POST'])
 @jwt_required()
 def remove_resident():
-    data = request.json
-    resident_name = data['resident_name']
+    data = request.get_json()
+    resident_name = data.get('resident_name')
     username = get_jwt_identity()
 
     if not is_user_admin(username):
         return jsonify({'error': 'Unauthorized: Only admins can remove residents.'}), 403
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
     try:
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        
         resident_id = get_resident_id(resident_name)
-        
-        # Begin transaction
+        if not resident_id:
+            return jsonify({'error': f'Resident {resident_name} not found'}), 404
+
         conn.start_transaction()
 
-        # Delete related ADL data
-        cursor.execute("DELETE FROM adl_chart WHERE resident_id = %s", (resident_id,))
-        
-        # Delete related EMAR data
-        cursor.execute("DELETE FROM emar_chart WHERE resident_id = %s", (resident_id,))
+        # 1) Delete any ADL entries
+        cursor.execute(
+            "DELETE FROM adl_chart WHERE resident_id = %s",
+            (resident_id,)
+        )
 
-        # Delete related non-med order administrations
-        cursor.execute("DELETE FROM non_med_order_administrations WHERE resident_id = %s", (resident_id,))
+        # 2) Delete any non-med order administrations
+        cursor.execute(
+            "DELETE FROM non_med_order_administrations WHERE resident_id = %s",
+            (resident_id,)
+        )
 
-        # Delete related non-medication orders
-        cursor.execute("DELETE FROM non_medication_orders WHERE resident_id = %s", (resident_id,))
+        # 3) Delete any non-medication orders
+        cursor.execute(
+            "DELETE FROM non_medication_orders WHERE resident_id = %s",
+            (resident_id,)
+        )
 
-        # Before deleting medications, delete entries from medication_time_slots
-        cursor.execute("""
-            DELETE mts FROM medication_time_slots mts
-            JOIN medications m ON mts.medication_id = m.id
+        # 4) Delete all EMAR entries for this resident directly
+        cursor.execute(
+            "DELETE FROM emar_chart WHERE resident_id = %s",
+            (resident_id,)
+        )
+
+        # 5) Also delete any EMAR entries tied to their medications
+        cursor.execute(
+            """
+            DELETE ec
+            FROM emar_chart AS ec
+            JOIN medications AS m ON ec.medication_id = m.id
             WHERE m.resident_id = %s
-        """, (resident_id,))
+            """,
+            (resident_id,)
+        )
 
-        # Delete related medications
-        cursor.execute("DELETE FROM medications WHERE resident_id = %s", (resident_id,))
+        # 6) Delete medication_time_slots links
+        cursor.execute(
+            """
+            DELETE mts
+            FROM medication_time_slots AS mts
+            JOIN medications AS m ON mts.medication_id = m.id
+            WHERE m.resident_id = %s
+            """,
+            (resident_id,)
+        )
 
-        # Finally, delete the resident
-        cursor.execute("DELETE FROM residents WHERE id = %s", (resident_id,))
-        
-        # Commit transaction
+        # 7) Delete the medications themselves
+        cursor.execute(
+            "DELETE FROM medications WHERE resident_id = %s",
+            (resident_id,)
+        )
+
+        # 8) Finally delete the resident record
+        cursor.execute(
+            "DELETE FROM residents WHERE id = %s",
+            (resident_id,)
+        )
+
         conn.commit()
-        log_action(username, 'Resident Removed', f'Resident Removed {resident_name}')
-        return jsonify({'message': f'Resident {resident_name} has been removed successfully'}), 200
-    except Error as e:
+        log_action(username, 'Resident Removed', f'Removed resident {resident_name} (ID {resident_id})')
+        return jsonify({'message': f'Resident {resident_name} removed successfully'}), 200
+
+    except Exception as e:
         conn.rollback()
         return jsonify({'error': str(e)}), 500
+
     finally:
-        if conn.is_connected():
-            cursor.close()
-            conn.close()
+        cursor.close()
+        conn.close()
 
 
 @app.route('/fetch_resident_information', methods=['POST'])
@@ -689,20 +771,33 @@ def update_resident_info():
             conn.close()
 
 
-@app.route('/fetch_active_residents', methods=['GET'])
-def fetch_active_residents():
+@app.route('/fetch_active_residents/<int:facility_id>', methods=['GET'])
+@jwt_required()
+def fetch_active_residents(facility_id):
+    """
+    Return the names of all active residents in the given facility.
+    """
     try:
         conn = get_db_connection()
         cursor = conn.cursor()
-        cursor.execute("SELECT name FROM residents WHERE is_active = TRUE")
+        cursor.execute(
+            """
+            SELECT name
+              FROM residents
+             WHERE is_active = TRUE
+               AND facility_id = %s
+            """,
+            (facility_id,)
+        )
         active_residents = [row[0] for row in cursor.fetchall()]
         return jsonify(active_residents=active_residents), 200
-    except Exception as e:
+
+    except Error as e:
         return jsonify({'error': str(e)}), 500
+
     finally:
-        if conn.is_connected():
-            cursor.close()
-            conn.close()
+        cursor.close()
+        conn.close()
 
 
 @app.route('/deactivate_resident', methods=['POST'])
@@ -2286,6 +2381,63 @@ def get_dashboard_data():
             conn.close()
 
 
+@app.route('/renew_tracked_item', methods=['POST'])
+@jwt_required()
+def renew_tracked_item():
+    """
+    Update an existing tracked_item:
+      - Set new certification & expiration dates
+      - Reset reminder interval
+      - Reset document_status to 'valid'
+      - Clear email_sent so next reminder can fire
+    """
+    data = request.get_json()
+    username = get_jwt_identity()
+
+    # Only admins may renew
+    if not is_user_admin(username):
+        return jsonify({'error': 'Unauthorized: Admins only'}), 403
+
+    # Validate presence of required fields
+    for field in ('item_id', 'certification_date', 'expiration_interval', 'reminder_days_before_expiration'):
+        if field not in data:
+            return jsonify({'error': f"Missing '{field}'"}), 400
+
+    # Parse & convert
+    try:
+        item_id = int(data['item_id'])
+        cert_date = datetime.strptime(data['certification_date'], '%Y-%m-%d').date()
+        interval = int(data['expiration_interval'])
+        remind   = int(data['reminder_days_before_expiration'])
+    except ValueError:
+        return jsonify({'error': 'Invalid date or interval format'}), 400
+
+    # Calculate new expiration
+    new_exp = cert_date + timedelta(days=interval)
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute("""
+            UPDATE tracked_items
+               SET document_date                  = %s,
+                   expiration_date                = %s,
+                   reminder_days_before_expiration = %s,
+                   document_status                = 'valid',
+                   email_sent                     = 0
+             WHERE item_id = %s
+        """, (cert_date, new_exp, remind, item_id))
+        conn.commit()
+        log_action(username, 'Renew Document', f"Item {item_id} renewed to expire {new_exp}")
+        return jsonify({'message': 'Tracked item renewed'}), 200
+    except Exception as e:
+        conn.rollback()
+        return jsonify({'error': str(e)}), 500
+    finally:
+        cursor.close()
+        conn.close()
+
+
 @app.route('/add_tracked_item_employee', methods=['POST'])
 @jwt_required()
 def add_tracked_item_employee():
@@ -2341,109 +2493,358 @@ def fetch_employee_tracked_items():
         conn = get_db_connection()
         cursor = conn.cursor()
 
-        sql = '''
-            SELECT ti.pertains_to, d.document_name, ti.document_date, ti.expiration_date, ti.document_status
-            FROM tracked_items ti
-            JOIN documents d ON ti.document_id = d.document_id
-            WHERE ti.category_type = 'Employee'
-        '''
+        sql = """
+          SELECT 
+            ti.pertains_to       AS employee_name,
+            d.document_name,
+            ti.document_date,
+            ti.expiration_date,
+            -- dynamically compute status:
+            CASE
+              WHEN ti.expiration_date < CURDATE() THEN 'Expired'
+              WHEN ti.expiration_date <= DATE_ADD(CURDATE(), INTERVAL ti.reminder_days_before_expiration DAY)
+                THEN 'Expiring Soon'
+              ELSE 'Valid'
+            END AS status
+          FROM tracked_items ti
+          JOIN documents d ON ti.document_id = d.document_id
+          WHERE ti.category_type = 'Employee'
+        """
+
         cursor.execute(sql)
-        result = cursor.fetchall()
+        rows = cursor.fetchall()
 
-        employee_tracked_items = [{
-            'employee_name': row[0],
-            'document_name': row[1],
+        items = [{
+            'employee_name':     row[0],
+            'document_name':     row[1],
             'certification_date': row[2].strftime('%Y-%m-%d'),
-            'expiration_date': row[3].strftime('%Y-%m-%d'),
-            'status': row[4]
-        } for row in result]
+            'expiration_date':   row[3].strftime('%Y-%m-%d'),
+            'status':            row[4]
+        } for row in rows]
 
-        return jsonify(employee_tracked_items), 200
+        return jsonify(items), 200
 
     except Exception as e:
         return jsonify({'error': str(e)}), 500
+
     finally:
-        if conn.is_connected():
-            conn.close()
+        cursor.close()
+        conn.close()
 
 
 @app.route('/fetch_facility_tracked_items', methods=['GET'])
 @jwt_required()
 def fetch_facility_tracked_items():
+    """
+    Return facility‐category tracked documents, including the facility name.
+    """
     try:
         conn = get_db_connection()
         cursor = conn.cursor()
 
-        sql = '''
-            SELECT d.document_name, ti.document_date, ti.expiration_date, ti.document_status
-            FROM tracked_items ti
-            JOIN documents d ON ti.document_id = d.document_id
-            WHERE ti.category_type = 'Facility'
-        '''
+        sql = """
+          SELECT 
+            d.document_name,
+            ti.document_date,
+            ti.expiration_date,
+            CASE
+              WHEN ti.expiration_date < CURDATE() THEN 'Expired'
+              WHEN ti.expiration_date <= DATE_ADD(CURDATE(), INTERVAL ti.reminder_days_before_expiration DAY)
+                THEN 'Expiring Soon'
+              ELSE 'Valid'
+            END AS status,
+            ti.facility_id,
+            f.facility_name
+          FROM tracked_items ti
+          JOIN documents d  ON ti.document_id  = d.document_id
+          JOIN facilities f ON ti.facility_id  = f.facility_id
+          WHERE ti.category_type = 'Facility'
+        """
+
         cursor.execute(sql)
-        result = cursor.fetchall()
+        rows = cursor.fetchall()
 
-        facility_tracked_items = [{
-            'document_name': row[0],
+        facility_items = [{
+            'document_name':      row[0],
             'certification_date': row[1].strftime('%Y-%m-%d'),
-            'expiration_date': row[2].strftime('%Y-%m-%d'),
-            'status': row[3]
-        } for row in result]
+            'expiration_date':    row[2].strftime('%Y-%m-%d'),
+            'status':             row[3],
+            'facility_id':        row[4],
+            'facility_name':      row[5]
+        } for row in rows]
 
-        return jsonify(facility_tracked_items), 200
+        return jsonify(facility_items), 200
 
     except Exception as e:
         return jsonify({'error': str(e)}), 500
+
     finally:
-        if conn.is_connected():
-            conn.close()
+        cursor.close()
+        conn.close()
+
+
+@app.route('/fetch_resident_tracked_items', methods=['GET'])
+@jwt_required()
+def fetch_resident_tracked_items():
+    """
+    Return document tracking for residents, computing status on the fly,
+    and include their facility name.
+    """
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+
+        sql = """
+          SELECT 
+            ti.pertains_to         AS resident_name,
+            d.document_name,
+            ti.document_date,
+            ti.expiration_date,
+            CASE
+              WHEN ti.expiration_date < CURDATE() THEN 'Expired'
+              WHEN ti.expiration_date <= DATE_ADD(CURDATE(), INTERVAL ti.reminder_days_before_expiration DAY)
+                THEN 'Expiring Soon'
+              ELSE 'Valid'
+            END AS status,
+            ti.facility_id,
+            f.facility_name
+          FROM tracked_items ti
+          JOIN documents d  ON ti.document_id   = d.document_id
+          JOIN facilities f ON ti.facility_id   = f.facility_id
+          WHERE ti.category_type = 'Resident'
+        """
+        cursor.execute(sql)
+        rows = cursor.fetchall()
+
+        items = [{
+            'resident_name':      row[0],
+            'document_name':      row[1],
+            'certification_date': row[2].strftime('%Y-%m-%d'),
+            'expiration_date':    row[3].strftime('%Y-%m-%d'),
+            'status':             row[4],
+            'facility_id':        row[5],
+            'facility_name':      row[6]
+        } for row in rows]
+
+        return jsonify(items), 200
+
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+    finally:
+        cursor.close()
+        conn.close()
+
+
+@app.route('/fetch_resident_document_details', methods=['GET'])
+@jwt_required()
+def fetch_resident_document_details():
+    """
+    Return a mapping of all resident‐category documents to their
+    default expiration intervals (in days).
+    """
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT document_name, expiration_interval "
+            "FROM documents "
+            "WHERE category = 'Resident'"
+        )
+        rows = cursor.fetchall()
+        # build { name: interval, ... }
+        mapping = {row[0]: row[1] for row in rows}
+        return jsonify(mapping), 200
+
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+    finally:
+        cursor.close()
+        conn.close()
 
 
 @app.route('/add_tracked_item_facility', methods=['POST'])
 @jwt_required()
 def add_tracked_item_facility():
+    """
+    Insert a new tracked document for a facility, with facility_id.
+    """
     data = request.get_json()
-    document_name = data['document_name']
-    custom_document_name = data.get('custom_document_name')
-    expiration_interval = data.get('expiration_interval')
-    certification_date = data['certification_date']
-    reminder_days_before_expiration = data['reminder_days_before_expiration']
+    username = get_jwt_identity()
+
+    if not is_user_admin(username):
+        return jsonify({'error': 'Unauthorized: Admins only'}), 403
+
+    docn     = data.get('document_name')
+    cert     = data.get('certification_date')
+    interval = data.get('expiration_interval')
+    remind   = data.get('reminder_days_before_expiration')
+    fid      = data.get('facility_id')
+
+    if not all([docn, cert, interval, remind, fid]):
+        return jsonify({'error': 'Missing required fields'}), 400
 
     try:
-        conn = get_db_connection()
-        with conn.cursor() as cursor:
-            if custom_document_name:
-                # Insert custom document into documents table if it doesn't already exist
-                cursor.execute(
-                    "INSERT INTO documents (document_name, expiration_interval, is_custom, category) VALUES (%s, %s, TRUE, 'Facility') ON DUPLICATE KEY UPDATE expiration_interval = VALUES(expiration_interval)",
-                    (custom_document_name, expiration_interval)
-                )
-                document_id = cursor.lastrowid
-            else:
-                # Fetch document_id for predefined documents
-                cursor.execute("SELECT document_id FROM documents WHERE document_name = %s AND category = 'Facility'", (document_name,))
-                result = cursor.fetchone()
-                if result:
-                    document_id = result[0]
-                else:
-                    return jsonify({'error': 'Document not found'}), 404
+        interval = int(interval)
+        remind   = int(remind)
+        cert_date = datetime.strptime(cert, "%Y-%m-%d").date()
+    except ValueError:
+        return jsonify({'error': 'Invalid date or interval format'}), 400
 
-            expiration_date = calculate_expiration_date(certification_date, expiration_interval)
-            
-            # Insert into tracked_items table
-            cursor.execute(
-                "INSERT INTO tracked_items (document_id, document_date, expiration_date, reminder_days_before_expiration, document_status, pertains_to, category_type) VALUES (%s, %s, %s, %s, 'valid', NULL, 'Facility')",
-                (document_id, certification_date, expiration_date, reminder_days_before_expiration)
-            )
-            conn.commit()
+    exp_date = cert_date + timedelta(days=interval)
 
-        return jsonify({'message': 'Tracked item added successfully'}), 200
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        # Resolve or create document
+        cursor.execute("""
+            SELECT document_id
+              FROM documents
+             WHERE document_name = %s
+               AND category = 'Facility'
+        """, (docn,))
+        row = cursor.fetchone()
+        if row:
+            document_id = row[0]
+        else:
+            cursor.execute("""
+                INSERT INTO documents
+                    (document_name, expiration_interval, is_custom, category)
+                VALUES (%s, %s, TRUE, 'Facility')
+            """, (docn, interval))
+            document_id = cursor.lastrowid
+
+        # Insert tracked_items with facility_id
+        cursor.execute("""
+            INSERT INTO tracked_items
+                (document_id,
+                 document_date,
+                 expiration_date,
+                 reminder_days_before_expiration,
+                 document_status,
+                 pertains_to,
+                 category_type,
+                 facility_id)
+            VALUES (%s, %s, %s, %s, 'Valid', NULL, 'Facility', %s)
+        """, (
+            document_id,
+            cert_date,
+            exp_date,
+            remind,
+            fid
+        ))
+
+        conn.commit()
+        log_action(username,
+                   'Add Facility Document',
+                   f"{docn} for facility {fid}, cert {cert}, expires {exp_date}")
+        return jsonify({'message': 'Facility tracked item added'}), 201
+
     except Exception as e:
         conn.rollback()
         return jsonify({'error': str(e)}), 500
+
     finally:
-        if conn.is_connected():
-            conn.close()
+        cursor.close()
+        conn.close()
+
+
+@app.route('/add_resident_tracked_item', methods=['POST'])
+@jwt_required()
+def add_resident_tracked_item():
+    """
+    Insert a new tracked document for a resident,
+    now including the facility_id for scoping.
+    """
+    data = request.get_json()
+    username = get_jwt_identity()
+
+    if not is_user_admin(username):
+        return jsonify({'error': 'Unauthorized: Admins only'}), 403
+
+    rn       = data.get('resident_name')
+    docn     = data.get('document_name')
+    cert     = data.get('certification_date')
+    interval = data.get('expiration_interval')
+    remind   = data.get('reminder_days')
+    fid      = data.get('facility_id')
+
+    if not all([rn, docn, cert, interval, remind, fid]):
+        return jsonify({'error': 'Missing required fields'}), 400
+
+    try:
+        interval = int(interval)
+        remind   = int(remind)
+        cert_date = datetime.strptime(cert, "%Y-%m-%d").date()
+    except ValueError:
+        return jsonify({'error': 'Invalid date or interval format'}), 400
+
+    exp_date = cert_date + timedelta(days=interval)
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        # Resolve resident_id
+        cursor.execute("SELECT id FROM residents WHERE name = %s", (rn,))
+        row = cursor.fetchone()
+        if not row:
+            return jsonify({'error': f"Resident '{rn}' not found"}), 404
+        resident_id = row[0]
+
+        # Resolve or create document_id
+        cursor.execute("""
+            SELECT document_id
+              FROM documents
+             WHERE document_name = %s
+               AND category = 'Resident'
+        """, (docn,))
+        doc_row = cursor.fetchone()
+        if doc_row:
+            document_id = doc_row[0]
+        else:
+            cursor.execute("""
+                INSERT INTO documents
+                    (document_name, expiration_interval, is_custom, category)
+                VALUES (%s, %s, 1, 'Resident')
+            """, (docn, interval))
+            document_id = cursor.lastrowid
+
+        # Insert into tracked_items, including facility_id
+        cursor.execute("""
+            INSERT INTO tracked_items
+                (document_id,
+                 document_date,
+                 expiration_date,
+                 reminder_days_before_expiration,
+                 document_status,
+                 pertains_to,
+                 category_type,
+                 facility_id)
+            VALUES (%s, %s, %s, %s, %s, %s, 'Resident', %s)
+        """, (
+            document_id,
+            cert_date,
+            exp_date,
+            remind,
+            'Valid',
+            rn,
+            fid
+        ))
+
+        conn.commit()
+        log_action(username,
+                   'Add Resident Document',
+                   f"{docn} for {rn} at facility {fid}, cert {cert}, expires {exp_date}")
+        return jsonify({'message': 'Tracked item added'}), 201
+
+    except Exception as e:
+        conn.rollback()
+        return jsonify({'error': str(e)}), 500
+
+    finally:
+        cursor.close()
+        conn.close()
 
 
 # ---------------------------------------- Data Insertion ---------------------------------------------- #
