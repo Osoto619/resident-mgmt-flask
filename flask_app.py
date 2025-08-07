@@ -1159,6 +1159,69 @@ def insert_medication():
             conn.close()
 
 
+@app.route('/remove_medication', methods=['POST'])
+@jwt_required()
+def remove_medication():
+    data = request.get_json()
+    resident_name   = data.get('resident_name')
+    medication_name = data.get('medication_name')
+    username = get_jwt_identity()
+
+    if not is_user_admin(username):
+        return jsonify({'error': 'Unauthorized: Admins only'}), 403
+    if not all([resident_name, medication_name]):
+        return jsonify({'error': 'resident_name and medication_name are required'}), 400
+
+    conn = get_db_connection()
+    try:
+        conn.start_transaction()
+        cursor = conn.cursor()
+
+        # 1) Resolve resident_id
+        cursor.execute("SELECT id FROM residents WHERE name = %s", (resident_name,))
+        row = cursor.fetchone()
+        if not row:
+            return jsonify({'error': f"Resident '{resident_name}' not found"}), 404
+        resident_id = row[0]
+
+        # 2) Resolve medication_id
+        cursor.execute("""
+            SELECT id
+              FROM medications
+             WHERE resident_id = %s
+               AND medication_name = %s
+        """, (resident_id, medication_name))
+        row = cursor.fetchone()
+        if not row:
+            return jsonify({'error': f"Medication '{medication_name}' not found for {resident_name}"}), 404
+        med_id = row[0]
+
+        # 3) Delete EMAR entries
+        cursor.execute("DELETE FROM emar_chart WHERE medication_id = %s", (med_id,))
+
+        # 4) Delete time-slot links
+        cursor.execute("DELETE FROM medication_time_slots WHERE medication_id = %s", (med_id,))
+
+        # 5) Delete the medication
+        cursor.execute("DELETE FROM medications WHERE id = %s", (med_id,))
+
+        conn.commit()
+        log_action(
+            username,
+            'Medication Removed',
+            f"Removed '{medication_name}' (med_id={med_id}) for {resident_name}"
+        )
+        return jsonify({'message': f"Medication '{medication_name}' removed"}), 200
+
+    except Error as e:
+        conn.rollback()
+        return jsonify({'error': str(e)}), 500
+
+    finally:
+        cursor.close()
+        conn.close()
+
+
 @app.route('/fetch_discontinued_medications/<resident_name>', methods=['GET'])
 @jwt_required()
 def fetch_discontinued_medications(resident_name):
@@ -2898,3 +2961,4 @@ if __name__ == '__main__':
     
     
     
+
