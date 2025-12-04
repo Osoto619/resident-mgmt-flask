@@ -1162,63 +1162,132 @@ def insert_medication():
 @app.route('/remove_medication', methods=['POST'])
 @jwt_required()
 def remove_medication():
-    data = request.get_json()
+    data = request.get_json() or {}
     resident_name   = data.get('resident_name')
     medication_name = data.get('medication_name')
-    username = get_jwt_identity()
+    medication_id   = data.get('medication_id')  # optional, for precise deletes
+    username        = get_jwt_identity()
 
+    # 1) Auth check
     if not is_user_admin(username):
         return jsonify({'error': 'Unauthorized: Admins only'}), 403
-    if not all([resident_name, medication_name]):
-        return jsonify({'error': 'resident_name and medication_name are required'}), 400
+
+    if not resident_name:
+        return jsonify({'error': 'resident_name is required'}), 400
+    if not medication_name and not medication_id:
+        return jsonify({'error': 'Provide medication_name or medication_id'}), 400
 
     conn = get_db_connection()
+    cursor = conn.cursor(dictionary=True)
     try:
         conn.start_transaction()
-        cursor = conn.cursor()
 
-        # 1) Resolve resident_id
-        cursor.execute("SELECT id FROM residents WHERE name = %s", (resident_name,))
-        row = cursor.fetchone()
-        if not row:
+        # 2) Resolve resident_id
+        cursor.execute(
+            "SELECT id, name FROM residents WHERE name = %s",
+            (resident_name,)
+        )
+        res_row = cursor.fetchone()
+        if not res_row:
+            conn.rollback()
             return jsonify({'error': f"Resident '{resident_name}' not found"}), 404
-        resident_id = row[0]
 
-        # 2) Resolve medication_id
-        cursor.execute("""
-            SELECT id
-              FROM medications
-             WHERE resident_id = %s
-               AND medication_name = %s
-        """, (resident_id, medication_name))
-        row = cursor.fetchone()
-        if not row:
-            return jsonify({'error': f"Medication '{medication_name}' not found for {resident_name}"}), 404
-        med_id = row[0]
+        resident_id = res_row['id']
 
-        # 3) Delete EMAR entries
-        cursor.execute("DELETE FROM emar_chart WHERE medication_id = %s", (med_id,))
+        # 3) Find meds to delete
+        meds_to_delete = []
 
-        # 4) Delete time-slot links
-        cursor.execute("DELETE FROM medication_time_slots WHERE medication_id = %s", (med_id,))
+        if medication_id:
+            # Explicit ID: delete only this one
+            cursor.execute("""
+                SELECT id, medication_name
+                FROM medications
+                WHERE id = %s AND resident_id = %s
+            """, (medication_id, resident_id))
+            row = cursor.fetchone()
+            if not row:
+                conn.rollback()
+                return jsonify({
+                    'error': f"Medication with id={medication_id} not found for resident '{resident_name}'"
+                }), 404
+            meds_to_delete = [row]
+            match_label = f"1 medication id={row['id']} ('{row['medication_name']}')"
 
-        # 5) Delete the medication
-        cursor.execute("DELETE FROM medications WHERE id = %s", (med_id,))
+        else:
+            # Case-insensitive match on name for this resident, remove ALL matches
+            cursor.execute("""
+                SELECT id, medication_name, dosage, medication_form, medication_type
+                FROM medications
+                WHERE resident_id = %s
+                  AND LOWER(medication_name) = LOWER(%s)
+            """, (resident_id, medication_name))
+            meds_to_delete = cursor.fetchall()
+
+            if not meds_to_delete:
+                conn.rollback()
+                return jsonify({
+                    'error': f"No medications named '{medication_name}' (case-insensitive) "
+                             f"found for resident '{resident_name}'"
+                }), 404
+
+            match_label = (
+                f"{len(meds_to_delete)} medication(s) named '{medication_name}' "
+                f"(case-insensitive) for resident '{resident_name}'"
+            )
+
+        removed_ids = []
+
+        # 4) For each medication, clean up related data then delete the med
+        for med in meds_to_delete:
+            mid = med['id']
+            removed_ids.append(mid)
+
+            # Delete EMAR entries for this resident + med
+            cursor.execute(
+                """
+                DELETE FROM emar_chart
+                WHERE resident_id = %s
+                  AND medication_id = %s
+                """,
+                (resident_id, mid)
+            )
+
+            # Delete time-slot links
+            cursor.execute(
+                "DELETE FROM medication_time_slots WHERE medication_id = %s",
+                (mid,)
+            )
+
+            # Delete the medication itself
+            cursor.execute(
+                "DELETE FROM medications WHERE id = %s",
+                (mid,)
+            )
 
         conn.commit()
+
+        # 5) Audit log
         log_action(
             username,
             'Medication Removed',
-            f"Removed '{medication_name}' (med_id={med_id}) for {resident_name}"
+            f"{match_label}; removed med_ids={removed_ids}"
         )
-        return jsonify({'message': f"Medication '{medication_name}' removed"}), 200
+
+        return jsonify({
+            'message': 'Medication(s) removed successfully',
+            'removed_medication_ids': removed_ids,
+            'count': len(removed_ids)
+        }), 200
 
     except Error as e:
         conn.rollback()
         return jsonify({'error': str(e)}), 500
 
     finally:
-        cursor.close()
+        try:
+            cursor.close()
+        except Exception:
+            pass
         conn.close()
 
 
@@ -2961,4 +3030,5 @@ if __name__ == '__main__':
     
     
     
+
 
